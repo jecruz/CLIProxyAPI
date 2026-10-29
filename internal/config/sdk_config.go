@@ -4,8 +4,12 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// ModelCapabilities contains optional exact-alias overrides, each with a required evidence source.
+	ModelCapabilities map[string]registry.ModelCapabilities `yaml:"model-capabilities,omitempty" json:"model-capabilities,omitempty"`
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 

@@ -59,6 +59,11 @@ type ModelInfo struct {
 	// This is optional and currently used for Gemini thinking budget normalization.
 	Thinking *ThinkingSupport `json:"thinking,omitempty"`
 
+	// Capabilities holds explicitly reported provider capabilities.
+	Capabilities *ModelCapabilities `json:"capabilities,omitempty"`
+	// ThinkingDefault marks an internal fallback that must not be advertised as verified.
+	ThinkingDefault bool `json:"-"`
+
 	// UserDefined indicates this model was defined through config file's models[]
 	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
 	// UserDefined models have thinking configuration passed through without validation.
@@ -528,6 +533,9 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 		return nil
 	}
 	copyModel := *model
+	if model.Capabilities != nil {
+		copyModel.Capabilities = model.Capabilities.Clone()
+	}
 	if len(model.SupportedGenerationMethods) > 0 {
 		copyModel.SupportedGenerationMethods = append([]string(nil), model.SupportedGenerationMethods...)
 	}
@@ -1143,6 +1151,9 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		if len(model.SupportedParameters) > 0 {
 			result["supported_parameters"] = append([]string(nil), model.SupportedParameters...)
+		}
+		for key, value := range ModelCapabilityFields(model) {
+			result[key] = value
 		}
 		return result
 

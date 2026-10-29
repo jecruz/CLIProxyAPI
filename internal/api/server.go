@@ -36,6 +36,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -1139,10 +1140,11 @@ func (s *Server) geminiGetHandler(geminiHandler *gemini.GeminiAPIHandler) gin.Ha
 }
 
 type homeModelEntry struct {
-	id          string
-	created     int64
-	ownedBy     string
-	displayName string
+	id           string
+	created      int64
+	ownedBy      string
+	displayName  string
+	capabilities registry.ModelCapabilities
 }
 
 func (s *Server) handleHomeModels(c *gin.Context) {
@@ -1189,6 +1191,10 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		return
 	}
 
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": formatHomeOpenAIModels(entries, &s.cfg.SDKConfig)})
+}
+
+func formatHomeOpenAIModels(entries []homeModelEntry, cfg *config.SDKConfig) []map[string]any {
 	filtered := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
 		model := map[string]any{
@@ -1201,12 +1207,15 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		if entry.ownedBy != "" {
 			model["owned_by"] = entry.ownedBy
 		}
+		for key, value := range entry.capabilities.Fields() {
+			model[key] = value
+		}
+		if cfg != nil {
+			registry.ApplyModelCapabilities(model, cfg.ModelCapabilities)
+		}
 		filtered = append(filtered, model)
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   filtered,
-	})
+	return filtered
 }
 
 func (s *Server) handleHomeGeminiModels(c *gin.Context) {
@@ -1280,7 +1289,31 @@ func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {
 		return nil, false
 	}
 
-	return entries, true
+	return appendHomeLocalModels(entries, s.cfg), true
+}
+
+func appendHomeLocalModels(entries []homeModelEntry, cfg *config.Config) []homeModelEntry {
+	if cfg == nil {
+		return entries
+	}
+	seen := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		seen[entry.id] = true
+	}
+	for _, provider := range cfg.OpenAICompatibility {
+		if provider.Disabled || !provider.DiscoverLocalModels {
+			continue
+		}
+		for _, model := range registry.GetGlobalRegistry().GetAvailableModelsByProvider(provider.Name) {
+			if model == nil || seen[model.ID] {
+				continue
+			}
+			seen[model.ID] = true
+			entries = append(entries, homeModelEntry{id: model.ID, created: model.Created, ownedBy: model.OwnedBy, displayName: model.DisplayName, capabilities: registry.CapabilitiesFromMetadata(registry.ModelCapabilityFields(model))})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
+	return entries
 }
 
 func formatHomeGeminiModels(entries []homeModelEntry) []map[string]any {
@@ -1331,7 +1364,7 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 		return nil, fmt.Errorf("home models payload has no sections")
 	}
 
-	seen := make(map[string]struct{})
+	seen := make(map[string]int)
 	out := make([]homeModelEntry, 0, 256)
 	for _, models := range bySection {
 		for _, model := range models {
@@ -1345,10 +1378,12 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 			if id == "" {
 				continue
 			}
-			if _, ok := seen[id]; ok {
+			if index, ok := seen[id]; ok {
+				// Multiple routes sharing one public ID cannot imply route-specific limits.
+				out[index].capabilities = registry.ModelCapabilities{}
 				continue
 			}
-			seen[id] = struct{}{}
+			seen[id] = len(out)
 
 			created := int64(0)
 			switch v := model["created"].(type) {
@@ -1374,10 +1409,11 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 			}
 
 			out = append(out, homeModelEntry{
-				id:          id,
-				created:     created,
-				ownedBy:     ownedBy,
-				displayName: displayName,
+				id:           id,
+				created:      created,
+				ownedBy:      ownedBy,
+				displayName:  displayName,
+				capabilities: registry.CapabilitiesFromMetadata(model),
 			})
 		}
 	}

@@ -2312,14 +2312,15 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 			thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
 		models = append(models, &ModelInfo{
-			ID:          modelID,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     compat.Name,
-			Type:        modelType,
-			DisplayName: modelID,
-			UserDefined: false,
-			Thinking:    thinking,
+			ID:              modelID,
+			Object:          "model",
+			Created:         now,
+			OwnedBy:         compat.Name,
+			Type:            modelType,
+			DisplayName:     modelID,
+			UserDefined:     false,
+			Thinking:        thinking,
+			ThinkingDefault: model.Thinking == nil && !model.Image,
 		})
 	}
 	return models
@@ -2361,8 +2362,17 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			UserDefined: true,
 		}
 		if name != "" {
-			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
+			if upstream := registry.LookupStaticModelInfo(name); upstream != nil {
 				info.Thinking = upstream.Thinking
+				info.ContextLength = upstream.ContextLength
+				info.MaxCompletionTokens = upstream.MaxCompletionTokens
+				info.InputTokenLimit = upstream.InputTokenLimit
+				info.OutputTokenLimit = upstream.OutputTokenLimit
+				info.SupportedParameters = append([]string(nil), upstream.SupportedParameters...)
+				info.SupportedInputModalities = append([]string(nil), upstream.SupportedInputModalities...)
+				if upstream.Capabilities != nil {
+					info.Capabilities = upstream.Capabilities.Clone()
+				}
 			}
 		}
 		out = append(out, info)

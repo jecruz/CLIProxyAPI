@@ -462,3 +462,10 @@ nonstream-keepalive-interval: 0
 #       params: # JSON paths (gjson/sjson syntax) to remove from the payload
 #         - "generationConfig.thinkingConfig.thinkingBudget"
 #         - "generationConfig.responseJsonSchema"
+
+# Optional verified capability overrides keyed by exact public model ID.
+# Each entry requires source (route-specific URL or operator evidence).
+# Optional keys: context-length, max-output-tokens, supports-reasoning,
+# reasoning-levels, supports-tool-calls, supports-image-input.
+# Unknown fields remain omitted; no Sol/Terra limits are supplied by default.
+model-capabilities: {}

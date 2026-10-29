@@ -271,26 +271,26 @@ func (c *Controller) probeCredential(ctx context.Context, p config.OpenAICompati
 		return s, false
 	}
 	var catalog struct {
-		Data *[]struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data *[]map[string]any `json:"data"`
 	}
 	if json.Unmarshal(body, &catalog) != nil || catalog.Data == nil || len(*catalog.Data) > 4096 {
 		return s, false
 	}
 	seen := make(map[string]bool)
 	models := []*registry.ModelInfo{}
-	for _, m := range *catalog.Data {
-		if m.ID == "" || len(m.ID) > 512 || strings.IndexFunc(m.ID, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
+	for _, metadata := range *catalog.Data {
+		id, _ := metadata["id"].(string)
+		capabilities := registry.CapabilitiesFromMetadata(metadata)
+		if id == "" || len(id) > 512 || strings.IndexFunc(id, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
 			return s, false
 		}
-		if seen[m.ID] {
+		if seen[id] {
 			continue
 		}
-		seen[m.ID] = true
+		seen[id] = true
 		// Engine identity requires the jointly defined producer/consumer contract in #4461.
 		label := p.Name + " (unknown engine)"
-		models = append(models, &registry.ModelInfo{ID: m.ID, Object: "model", OwnedBy: label, Type: "openai-compatibility", DisplayName: m.ID, Description: label})
+		models = append(models, &registry.ModelInfo{ID: id, Object: "model", OwnedBy: label, Type: "openai-compatibility", DisplayName: id, Description: label, Capabilities: capabilities.Clone()})
 	}
 	s.Models = models
 	if len(s.Models) == 0 {
@@ -307,6 +307,9 @@ func cloneModels(models []*registry.ModelInfo) []*registry.ModelInfo {
 	out := make([]*registry.ModelInfo, 0, len(models))
 	for _, m := range models {
 		copy := *m
+		if m.Capabilities != nil {
+			copy.Capabilities = m.Capabilities.Clone()
+		}
 		out = append(out, &copy)
 	}
 	return out

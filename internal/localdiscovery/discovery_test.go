@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
 func TestLiveCatalogSwitchAndDownWithdrawsModels(t *testing.T) {
@@ -351,5 +352,30 @@ func TestSelfReferencePortsAreComparedNumerically(t *testing.T) {
 		if validEndpoint(endpoint) {
 			t.Errorf("accepted self-reference or invalid numeric port: %s", endpoint)
 		}
+	}
+}
+
+func TestDiscoveryPreservesReportedCapabilitiesWithoutGuessing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[{"id":"reported-local","context_length":16384,"max_output_tokens":2048,"supports_reasoning":false,"supports_tool_calls":true,"supports_image_input":false},{"id":"unknown-local"}]}`)
+	}))
+	defer server.Close()
+	c := New(nil)
+	c.Configure([]config.OpenAICompatibility{{Name: "Bay", BaseURL: server.URL + "/v1", DiscoverLocalModels: true}})
+	c.Refresh(context.Background())
+	models := c.Models("Bay", server.URL+"/v1")
+	if len(models) != 2 {
+		t.Fatalf("catalog=%+v", models)
+	}
+	fields := registry.ModelCapabilityFields(models[0])
+	if fields["context_length"] != 16384 || fields["max_output_tokens"] != 2048 || fields["supports_reasoning"] != false || fields["supports_tool_calls"] != true || fields["supports_image_input"] != false {
+		t.Fatalf("reported metadata lost: %#v", fields)
+	}
+	if len(registry.ModelCapabilityFields(models[1])) != 0 {
+		t.Fatal("unknown local capabilities invented")
+	}
+	models[0].Capabilities.ReasoningLevels = append(models[0].Capabilities.ReasoningLevels, "mutated")
+	if len(c.Models("Bay", server.URL+"/v1")[0].Capabilities.ReasoningLevels) != 0 {
+		t.Fatal("caller mutated cached capabilities")
 	}
 }

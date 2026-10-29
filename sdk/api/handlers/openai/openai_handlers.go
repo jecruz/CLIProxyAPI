@@ -67,7 +67,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := h.Models()
 
-	// Filter to only include the 4 required fields: id, object, created, owned_by
+	// Keep standard identity fields and verified capability extensions.
 	filteredModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
 		filteredModel := map[string]any{
@@ -85,6 +85,12 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 			filteredModel["owned_by"] = ownedBy
 		}
 
+		for key, value := range registry.CapabilitiesFromMetadata(model).Fields() {
+			filteredModel[key] = value
+		}
+		if h.BaseAPIHandler != nil && h.Cfg != nil {
+			registry.ApplyModelCapabilities(filteredModel, h.Cfg.ModelCapabilities)
+		}
 		filteredModels[i] = filteredModel
 	}
 
