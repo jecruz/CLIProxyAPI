@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/localdiscovery"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -96,6 +97,10 @@ type Service struct {
 
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
+
+	localDiscovery       *localdiscovery.Controller
+	localDiscoveryCancel context.CancelFunc
+	localDiscoveryDone   chan struct{}
 
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
@@ -1112,10 +1117,16 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	defer s.configUpdateMu.Unlock()
 
 	previousStrategy := ""
+	localProviderNames := make(map[string]bool)
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
 	s.cfgMu.RLock()
 	if s.cfg != nil {
+		for _, provider := range s.cfg.OpenAICompatibility {
+			if provider.DiscoverLocalModels {
+				localProviderNames[strings.ToLower(provider.Name)] = true
+			}
+		}
 		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
@@ -1129,6 +1140,11 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	}
 	if newCfg == nil {
 		return
+	}
+	for _, provider := range newCfg.OpenAICompatibility {
+		if provider.DiscoverLocalModels {
+			localProviderNames[strings.ToLower(provider.Name)] = true
+		}
 	}
 
 	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
@@ -1183,6 +1199,9 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	if s.localDiscovery != nil {
+		s.localDiscovery.Configure(newCfg.OpenAICompatibility)
+	}
 	if s.coreManager != nil {
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
@@ -1198,6 +1217,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	})
 	ctx := context.Background()
 	s.registerConfigAPIKeyAuths(ctx, newCfg)
+	s.refreshLocalDiscoveryRegistrationsLocked(localProviderNames)
 	s.syncPluginRuntime(ctx)
 }
 
@@ -1219,12 +1239,24 @@ func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Con
 		return
 	}
 
+	localNames := make(map[string]bool)
+	for _, provider := range cfg.OpenAICompatibility {
+		if provider.DiscoverLocalModels && !provider.Disabled {
+			localNames[strings.ToLower(provider.Name)] = true
+		}
+	}
 	tasks := make([]modelRegistrationTask, 0, len(auths))
 	for _, auth := range auths {
+		registrationCtx := ctx
 		if !isConfigAPIKeyAuth(auth) {
-			continue
+			_, name, compatible := openAICompatInfoFromAuth(auth)
+			if !compatible || !localNames[strings.ToLower(name)] {
+				continue
+			}
+			// Keyless local entries are synthesized runtime state, never auth files.
+			registrationCtx = coreauth.WithSkipPersist(ctx)
 		}
-		prepared := s.prepareCoreAuthForModelRegistration(ctx, auth)
+		prepared := s.prepareCoreAuthForModelRegistration(registrationCtx, auth)
 		if prepared == nil {
 			continue
 		}
@@ -1233,7 +1265,7 @@ func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Con
 			phase:    modelRegistrationPhaseConfigAPIKey,
 			category: modelRegistrationCategory(authForRegistration),
 			run: func() {
-				s.completeModelRegistrationForAuth(ctx, authForRegistration)
+				s.completeModelRegistrationForAuth(registrationCtx, authForRegistration)
 			},
 		})
 	}
@@ -1481,7 +1513,11 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	s.localDiscovery = localdiscovery.New(s.refreshLocalDiscoveryRegistrations, localDiscoveryListenerPorts(s.cfg)...)
+	s.localDiscovery.Configure(s.cfg.OpenAICompatibility)
+	options := append([]api.ServerOption(nil), s.serverOptions...)
+	options = append(options, api.WithLocalDiscovery(s.localDiscovery))
+	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, options...)
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {
 		s.syncPluginModelRuntime(ctx)
@@ -1563,6 +1599,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	s.startLocalDiscovery(ctx)
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil && !homeEnabled {
@@ -1597,6 +1634,13 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		if ctx == nil {
 			ctx = context.Background()
+		}
+		if s.localDiscoveryCancel != nil {
+			s.localDiscoveryCancel()
+			select {
+			case <-s.localDiscoveryDone:
+			case <-ctx.Done():
+			}
 		}
 
 		if s.homeCancel != nil {
@@ -1872,6 +1916,18 @@ func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
+					if compat.DiscoverLocalModels {
+						var live []*ModelInfo
+						if s.localDiscovery != nil {
+							live = s.localDiscovery.Models(compat.Name, compat.BaseURL)
+						}
+						if len(live) == 0 {
+							GlobalModelRegistry().UnregisterClient(a.ID)
+						} else {
+							s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(live, a.Prefix, s.cfg.ForceModelPrefix))
+						}
+						return
+					}
 					ms := buildOpenAICompatibilityConfigModels(compat)
 					// Register and return
 					if len(ms) > 0 {

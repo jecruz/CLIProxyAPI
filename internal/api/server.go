@@ -31,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/localdiscovery"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
@@ -62,10 +63,16 @@ type serverOptionConfig struct {
 	postAuthHook         auth.PostAuthHook
 	postAuthPersistHook  auth.PostAuthHook
 	pluginHost           *pluginhost.Host
+	localDiscovery       *localdiscovery.Controller
 }
 
 // ServerOption customises HTTP server construction.
 type ServerOption func(*serverOptionConfig)
+
+// WithLocalDiscovery exposes credential-protected local catalog status and refresh operations.
+func WithLocalDiscovery(controller *localdiscovery.Controller) ServerOption {
+	return func(options *serverOptionConfig) { options.localDiscovery = controller }
+}
 
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
@@ -313,6 +320,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
+	s.mgmt.SetLocalDiscovery(optionState.localDiscovery)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -606,6 +614,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/diagnostics/repair-actions", s.mgmt.GetDiagnosticsRepairActions)
 		mgmt.POST("/diagnostics/repair-actions/:id", s.mgmt.PostDiagnosticsRepairAction)
 		mgmt.GET("/provider-doctor", s.mgmt.GetProviderDoctor)
+		mgmt.GET("/local-engines", s.mgmt.GetLocalEngines)
+		mgmt.POST("/local-engines/refresh", s.mgmt.RefreshLocalEngines)
 		mgmt.POST("/provider-doctor/check", s.mgmt.CheckProviderRoute)
 		mgmt.POST("/provider-doctor/live-probe", s.mgmt.LiveProbeProvider)
 		mgmt.GET("/router-advisor", s.mgmt.GetRouterAdvisor)

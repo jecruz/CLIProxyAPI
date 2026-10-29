@@ -652,6 +652,9 @@ type OpenAICompatibility struct {
 	// Models defines the model configurations including aliases for routing.
 	Models []OpenAICompatibilityModel `yaml:"models" json:"models"`
 
+	// DiscoverLocalModels replaces static models with the live loopback /v1/models catalog.
+	DiscoverLocalModels bool `yaml:"discover-local-models,omitempty" json:"discover-local-models,omitempty"`
+
 	// Headers optionally adds extra HTTP headers for requests sent to this provider.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 

@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/localdiscovery"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -50,6 +51,7 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 	postAuthPersistHook coreauth.PostAuthHook
 	pluginHost          *pluginhost.Host
+	localDiscovery      *localdiscovery.Controller
 }
 
 // NewHandler creates a new management handler instance.
