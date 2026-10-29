@@ -1,6 +1,10 @@
 package management
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,185 +32,344 @@ var (
 	errOAuthSessionExists     = errors.New("oauth session already exists")
 )
 
+// oauthSessionGeneration is an immutable per-registration ownership token.
+type oauthSessionGeneration struct{ state, token string }
+type oauthGenerationContextKey struct{}
+
+// oauthGeneration returns the immutable ownership token carried by a login worker.
+func oauthGeneration(ctx context.Context) *oauthSessionGeneration {
+	if ctx == nil {
+		return nil
+	}
+	generation, _ := ctx.Value(oauthGenerationContextKey{}).(*oauthSessionGeneration)
+	return generation
+}
+
+// oauthSession is a snapshot; terminal outcomes are retained, never inferred from absence.
 type oauthSession struct {
-	Provider  string
-	Status    string
-	Source    string
-	Metadata  map[string]any
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	generation  *oauthSessionGeneration
+	Phase       string
+	Provider    string
+	Status      string
+	Source      string
+	Metadata    map[string]any
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+	RetainUntil time.Time
+}
+
+type oauthSessionRecord struct {
+	pollMu  sync.Mutex
+	mu      sync.Mutex
+	session oauthSession
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 type oauthSessionStore struct {
 	mu       sync.RWMutex
 	ttl      time.Duration
-	sessions map[string]oauthSession
+	now      func() time.Time
+	sessions map[string]*oauthSessionRecord
 }
 
 func newOAuthSessionStore(ttl time.Duration) *oauthSessionStore {
 	if ttl <= 0 {
 		ttl = oauthSessionTTL
 	}
-	return &oauthSessionStore{
-		ttl:      ttl,
-		sessions: make(map[string]oauthSession),
+	return &oauthSessionStore{ttl: ttl, now: time.Now, sessions: make(map[string]*oauthSessionRecord)}
+}
+
+func (s *oauthSessionStore) lookup(state string) *oauthSessionRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sessions[strings.TrimSpace(state)]
+}
+
+func (s *oauthSessionStore) expireLocked(record *oauthSessionRecord) {
+	if record.session.Phase == "pending" && !s.now().Before(record.session.ExpiresAt) {
+		s.finishLocked(record, "expired", "Authentication expired; start again")
 	}
 }
 
-func (s *oauthSessionStore) purgeExpiredLocked(now time.Time) {
-	for state, session := range s.sessions {
-		if !session.ExpiresAt.IsZero() && now.After(session.ExpiresAt) {
-			delete(s.sessions, state)
+func (s *oauthSessionStore) finishLocked(record *oauthSessionRecord, phase, message string) {
+	record.session.Phase = phase
+	record.session.Status = message
+	record.session.RetainUntil = s.now().Add(s.ttl)
+	if phase == "expired" {
+		record.session.RetainUntil = record.session.ExpiresAt.Add(s.ttl)
+	}
+	record.cancel()
+}
+
+func (s *oauthSessionStore) purgeExpired() {
+	s.mu.RLock()
+	records := make(map[string]*oauthSessionRecord, len(s.sessions))
+	for state, record := range s.sessions {
+		records[state] = record
+	}
+	s.mu.RUnlock()
+	for state, record := range records {
+		// A save hook may register another login while holding this record's
+		// commit lock. Cleanup is opportunistic; never wait on that lock.
+		if !record.mu.TryLock() {
+			continue
 		}
+		s.expireLocked(record)
+		expired := record.session.Phase != "pending" && !s.now().Before(record.session.RetainUntil)
+		if expired {
+			s.mu.Lock()
+			if s.sessions[state] == record {
+				delete(s.sessions, state)
+			}
+			s.mu.Unlock()
+		}
+		record.mu.Unlock()
 	}
 }
 
-func (s *oauthSessionStore) Register(state, provider string) {
+func (s *oauthSessionStore) register(state, provider, source string, metadata map[string]any,
+	parent context.Context, deadline time.Time) (context.Context, error) {
 	state = strings.TrimSpace(state)
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	if state == "" || provider == "" {
-		return
+	if err := ValidateOAuthState(state); err != nil {
+		return nil, err
 	}
-	now := time.Now()
-
+	if provider == "" {
+		return nil, errUnsupportedOAuthFlow
+	}
+	s.purgeExpired()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
-	s.sessions[state] = oauthSession{
-		Provider:  provider,
-		Status:    "",
-		Source:    oauthSessionSourceBuiltin,
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
+	now := s.now()
+	// Validate the absolute producer deadline after cleanup and lock acquisition;
+	// neither time spent waiting nor another commit can extend its authority.
+	if !now.Before(deadline) {
+		return nil, fmt.Errorf("login deadline has expired")
 	}
+	if _, exists := s.sessions[state]; exists {
+		return nil, errOAuthSessionExists
+	}
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return nil, fmt.Errorf("create oauth owner: %w", err)
+	}
+	generation := &oauthSessionGeneration{state: state, token: hex.EncodeToString(token)}
+	ctx, cancel := context.WithDeadline(context.WithValue(parent, oauthGenerationContextKey{}, generation), deadline)
+	record := &oauthSessionRecord{
+		session: oauthSession{generation: generation, Phase: "pending", Provider: provider, Source: source,
+			Metadata: cloneOAuthSessionMetadata(metadata), CreatedAt: now, ExpiresAt: deadline},
+		ctx: ctx, cancel: cancel,
+	}
+	s.sessions[state] = record
+	return ctx, nil
 }
 
-func (s *oauthSessionStore) RegisterPlugin(state, provider string, metadata map[string]any) error {
-	state = strings.TrimSpace(state)
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	if state == "" || provider == "" {
-		return fmt.Errorf("%w: empty state or provider", errInvalidOAuthState)
-	}
-	if errState := ValidateOAuthState(state); errState != nil {
-		return errState
-	}
-	now := time.Now()
+func (s *oauthSessionStore) Register(state, provider string) context.Context {
+	ctx, _ := s.register(state, provider, oauthSessionSourceBuiltin, nil, context.Background(), s.now().Add(5*time.Minute))
+	return ctx
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// RegisterPlugin honors the producer deadline, defaulting to five minutes when omitted.
+func (s *oauthSessionStore) RegisterPlugin(state, provider string, metadata map[string]any, expiresAt ...time.Time) error {
+	_, err := s.RegisterPluginContext(state, provider, metadata, expiresAt...)
+	return err
+}
 
-	s.purgeExpiredLocked(now)
-	if _, ok := s.sessions[state]; ok {
-		return errOAuthSessionExists
+// RegisterPluginContext returns the owner context for the exact newly registered plugin login.
+func (s *oauthSessionStore) RegisterPluginContext(state, provider string, metadata map[string]any, expiresAt ...time.Time) (context.Context, error) {
+	deadline := s.now().Add(5 * time.Minute)
+	if len(expiresAt) > 0 && !expiresAt[0].IsZero() {
+		deadline = expiresAt[0]
 	}
-	s.sessions[state] = oauthSession{
-		Provider:  provider,
-		Status:    "",
-		Source:    oauthSessionSourcePlugin,
-		Metadata:  cloneOAuthSessionMetadata(metadata),
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
+	return s.register(state, provider, oauthSessionSourcePlugin, metadata, context.Background(), deadline)
+}
+
+// RegisterContext bounds acquisition, callback waits, and token exchange for one builtin flow.
+func (s *oauthSessionStore) RegisterContext(state, provider string, parent context.Context, duration time.Duration) (context.Context, error) {
+	return s.register(state, provider, oauthSessionSourceBuiltin, nil, parent, s.now().Add(duration))
+}
+
+// currentLocked checks identity while the record lock prevents purge/replacement.
+func (s *oauthSessionStore) currentLocked(state string, record *oauthSessionRecord, generation *oauthSessionGeneration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return generation != nil && record.session.generation == generation && s.sessions[strings.TrimSpace(state)] == record
+}
+
+func (s *oauthSessionStore) transition(state string, generation *oauthSessionGeneration, phase, message string) bool {
+	record := s.lookup(state)
+	if record == nil {
+		return false
 	}
-	return nil
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if !s.currentLocked(state, record, generation) {
+		return false
+	}
+	s.expireLocked(record)
+	if record.session.Phase != "pending" {
+		return false
+	}
+	s.finishLocked(record, phase, message)
+	return true
 }
 
 func (s *oauthSessionStore) SetError(state, message string) {
-	state = strings.TrimSpace(state)
-	message = strings.TrimSpace(message)
-	if state == "" {
-		return
+	if record := s.lookup(state); record != nil {
+		s.setErrorGeneration(state, record.session.generation, message)
 	}
-	if message == "" {
+}
+
+func (s *oauthSessionStore) setErrorGeneration(state string, generation *oauthSessionGeneration, message string) {
+	if strings.TrimSpace(message) == "" {
 		message = "Authentication failed"
 	}
-	now := time.Now()
+	s.transition(state, generation, "failed", strings.TrimSpace(message))
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
-	session, ok := s.sessions[state]
-	if !ok {
-		return
-	}
-	session.Status = message
-	session.ExpiresAt = now.Add(s.ttl)
-	s.sessions[state] = session
+// SetErrorContext cannot apply a stale worker's error to a replacement login.
+func (s *oauthSessionStore) SetErrorContext(state string, owner context.Context, message string) {
+	s.setErrorGeneration(state, oauthGeneration(owner), message)
 }
 
 func (s *oauthSessionStore) Complete(state string) {
-	state = strings.TrimSpace(state)
-	if state == "" {
-		return
+	if record := s.lookup(state); record != nil {
+		s.transition(state, record.session.generation, "succeeded", "")
 	}
-	now := time.Now()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
-	delete(s.sessions, state)
 }
 
-func (s *oauthSessionStore) CompleteProvider(provider string, source string) int {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider == "" {
-		return 0
+// CompleteContext completes only the generation that originally started this worker.
+func (s *oauthSessionStore) CompleteContext(state string, owner context.Context) {
+	s.transition(state, oauthGeneration(owner), "succeeded", "")
+}
+
+// Cancel serializes with credential commit; an existing terminal outcome never changes.
+func (s *oauthSessionStore) Cancel(state string) (oauthSession, bool) {
+	record := s.lookup(state)
+	if record == nil {
+		return oauthSession{}, false
 	}
-	source = strings.TrimSpace(source)
-	now := time.Now()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if !s.currentLocked(state, record, record.session.generation) {
+		return oauthSession{}, false
+	}
+	s.expireLocked(record)
+	if record.session.Phase == "pending" {
+		s.finishLocked(record, "cancelled", "Authentication cancelled")
+	}
+	return record.session, true
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// CancelOwned refuses a stale client token before expiring or changing the current generation.
+func (s *oauthSessionStore) CancelOwned(state, token string) (oauthSession, bool) {
+	record := s.lookup(state)
+	if record == nil {
+		return oauthSession{}, false
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	generation := record.session.generation
+	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(generation.token)) != 1 || !s.currentLocked(state, record, generation) {
+		return oauthSession{}, false
+	}
+	s.expireLocked(record)
+	if record.session.Phase == "pending" {
+		s.finishLocked(record, "cancelled", "Authentication cancelled")
+	}
+	return record.session, true
+}
 
-	s.purgeExpiredLocked(now)
-	removed := 0
-	for state, session := range s.sessions {
-		if strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
-			delete(s.sessions, state)
-			removed++
+// oauthAttemptToken returns only the ownership capability captured at registration.
+func oauthAttemptToken(ctx context.Context) string {
+	if generation := oauthGeneration(ctx); generation != nil {
+		return generation.token
+	}
+	return ""
+}
+
+// Commit is the credential-save linearization point shared with cancellation.
+// Once commit wins this lock before expiry, persistence runs without cancellation;
+// a cancel that wins first can never call save. Other sessions have separate locks.
+func (s *oauthSessionStore) Commit(state string, owner context.Context, save func(context.Context) (string, error)) (string, error) {
+	record := s.lookup(state)
+	if record == nil {
+		return "", errOAuthSessionNotPending
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if !s.currentLocked(state, record, oauthGeneration(owner)) {
+		return "", errOAuthSessionNotPending
+	}
+	s.expireLocked(record)
+	if record.session.Phase != "pending" || record.ctx.Err() != nil {
+		return "", errOAuthSessionNotPending
+	}
+	path, err := save(context.WithoutCancel(record.ctx))
+	if err != nil {
+		s.finishLocked(record, "failed", "Failed to save authentication tokens")
+		return path, err
+	}
+	s.finishLocked(record, "succeeded", "")
+	return path, nil
+}
+
+func (s *oauthSessionStore) CompleteProvider(provider, source string) int {
+	s.mu.RLock()
+	records := make(map[string]*oauthSessionGeneration)
+	for state, record := range s.sessions {
+		// Provider/source and generation are immutable after registration.
+		if strings.EqualFold(record.session.Provider, strings.TrimSpace(provider)) && (source == "" || record.session.Source == source) {
+			records[state] = record.session.generation
 		}
 	}
-	return removed
+	s.mu.RUnlock()
+	return s.completeProviderRecords(records)
+}
+
+// completeProviderRecords retains the generation observed by the provider batch.
+func (s *oauthSessionStore) completeProviderRecords(records map[string]*oauthSessionGeneration) int {
+	count := 0
+	for state, generation := range records {
+		if s.transition(state, generation, "succeeded", "") {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
-	state = strings.TrimSpace(state)
-	now := time.Now()
+	return s.getGeneration(state, nil)
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
-	session, ok := s.sessions[state]
-	session.Metadata = cloneOAuthSessionMetadata(session.Metadata)
-	return session, ok
+// getGeneration rejects a replaced record before any lazy expiry or response.
+func (s *oauthSessionStore) getGeneration(state string, generation *oauthSessionGeneration) (oauthSession, bool) {
+	record := s.lookup(state)
+	if record == nil {
+		return oauthSession{}, false
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if generation == nil {
+		generation = record.session.generation
+	}
+	if !s.currentLocked(state, record, generation) {
+		return oauthSession{}, false
+	}
+	s.expireLocked(record)
+	if record.session.Phase != "pending" && !s.now().Before(record.session.RetainUntil) {
+		return oauthSession{}, false
+	}
+	snapshot := record.session
+	snapshot.Metadata = cloneOAuthSessionMetadata(snapshot.Metadata)
+	return snapshot, true
 }
 
 func (s *oauthSessionStore) IsPending(state, provider string) bool {
-	state = strings.TrimSpace(state)
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	now := time.Now()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.purgeExpiredLocked(now)
-	session, ok := s.sessions[state]
-	if !ok {
-		return false
-	}
-	if session.Status != "" {
-		return false
-	}
-	if session.Source == oauthSessionSourcePlugin {
-		return false
-	}
-	if provider == "" {
-		return true
-	}
-	return strings.EqualFold(session.Provider, provider)
+	session, ok := s.Get(state)
+	return ok && session.Phase == "pending" && session.Source != oauthSessionSourcePlugin &&
+		(provider == "" || strings.EqualFold(session.Provider, strings.TrimSpace(provider)))
 }
 
 func cloneOAuthSessionMetadata(in map[string]any) map[string]any {
@@ -222,14 +385,21 @@ func cloneOAuthSessionMetadata(in map[string]any) map[string]any {
 
 var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
 
+// RegisterOAuthSession records a legacy state-only login.
+// Deprecated: Worker ownership is not returned; see the SDK migration in #4367.
 func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state, provider) }
 
-func RegisterPluginOAuthSession(state, provider string, metadata map[string]any) error {
-	return oauthSessions.RegisterPlugin(state, provider, metadata)
+// RegisterPluginOAuthSession records a plugin login using its authoritative deadline when supplied.
+func RegisterPluginOAuthSession(state, provider string, metadata map[string]any, expiresAt ...time.Time) error {
+	return oauthSessions.RegisterPlugin(state, provider, metadata, expiresAt...)
 }
 
+// SetOAuthSessionError applies a legacy state-only error.
+// Deprecated: Async workers must use ownership-bound transitions; see #4367.
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
 
+// CompleteOAuthSession applies legacy state-only completion.
+// Deprecated: Async workers must use ownership-bound transitions; see #4367.
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
 
 func CompleteOAuthSessionsByProvider(provider string) int {
@@ -240,12 +410,19 @@ func CompletePluginOAuthSessionsByProvider(provider string) int {
 	return oauthSessions.CompleteProvider(provider, oauthSessionSourcePlugin)
 }
 
+// GetOAuthSession preserves the legacy getter: successful completion is no longer pending.
 func GetOAuthSession(state string) (provider string, status string, ok bool) {
 	session, ok := oauthSessions.Get(state)
-	if !ok {
+	if !ok || session.Phase == "succeeded" {
 		return "", "", false
 	}
 	return session.Provider, session.Status, true
+}
+
+// GetOAuthSessionPhase returns explicit lifecycle state, including retained success.
+func GetOAuthSessionPhase(state string) (string, bool) {
+	session, ok := oauthSessions.Get(state)
+	return session.Phase, ok
 }
 
 func GetOAuthSessionDetails(state string) (provider string, status string, isPlugin bool, metadata map[string]any, ok bool) {
@@ -357,12 +534,21 @@ func WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage string)
 	return filePath, nil
 }
 
+// WriteOAuthCallbackFileForPendingSession serializes callback publication against cancel.
 func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage string) (string, error) {
 	canonicalProvider, err := NormalizeOAuthProvider(provider)
 	if err != nil {
 		return "", err
 	}
-	if !IsOAuthSessionPending(state, canonicalProvider) {
+	record := oauthSessions.lookup(state)
+	if record == nil {
+		return "", errOAuthSessionNotPending
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	oauthSessions.expireLocked(record)
+	if record.session.Phase != "pending" || record.session.Source != oauthSessionSourceBuiltin ||
+		!strings.EqualFold(record.session.Provider, canonicalProvider) {
 		return "", errOAuthSessionNotPending
 	}
 	return WriteOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage)

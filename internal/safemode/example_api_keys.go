@@ -175,9 +175,9 @@ func warningPageHTML(configPath string, keys []string) string {
 	if strings.TrimSpace(configPath) != "" {
 		b.WriteString(`<p>Edit <code class="path">`)
 		b.WriteString(html.EscapeString(configPath))
-		b.WriteString(`</code>, set strong random API keys, then restart CLIProxyAPI.</p>`)
+		b.WriteString(`</code>, set strong random API keys, then restart LLM Dynamix Engine.</p>`)
 	} else {
-		b.WriteString(`<p>Edit your config file, set strong random API keys, then restart CLIProxyAPI.</p>`)
+		b.WriteString(`<p>Edit your config file, set strong random API keys, then restart LLM Dynamix Engine.</p>`)
 	}
 	b.WriteString(`</section></main></body></html>`)
 	return b.String()

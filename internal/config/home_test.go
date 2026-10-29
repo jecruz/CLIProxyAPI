@@ -2,6 +2,20 @@ package config
 
 import "testing"
 
+func TestLLMDynamixBackendDefaults(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte(`api-keys: ["real-key"]`))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+
+	if DefaultAuthDir != "~/.llmdynamix" {
+		t.Fatalf("DefaultAuthDir = %q, want ~/.llmdynamix", DefaultAuthDir)
+	}
+	if cfg.RemoteManagement.PanelGitHubRepository != "https://github.com/jecruz/llmdynamix" {
+		t.Fatalf("PanelGitHubRepository = %q, want LLM Dynamix repository", cfg.RemoteManagement.PanelGitHubRepository)
+	}
+}
+
 func TestParseConfigBytesIgnoresHomeConfig(t *testing.T) {
 	cfg, err := ParseConfigBytes([]byte(`
 home:

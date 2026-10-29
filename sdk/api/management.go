@@ -82,26 +82,37 @@ func WriteConfig(path string, data []byte) error {
 }
 
 // RegisterOAuthSession records a pending OAuth callback state.
+// Deprecated: This state-only API does not return worker ownership. New async
+// integrations must await the generation-owned SDK API tracked by #4367.
 func RegisterOAuthSession(state, provider string) {
 	internalmanagement.RegisterOAuthSession(state, provider)
 }
 
 // SetOAuthSessionError stores an OAuth session error message.
+// Deprecated: A delayed state-only worker can fail a replacement login. The
+// generation-owned replacement and migration are tracked by #4367.
 func SetOAuthSessionError(state, message string) {
 	internalmanagement.SetOAuthSessionError(state, message)
 }
 
 // CompleteOAuthSession marks a single OAuth session as completed.
+// Deprecated: A delayed state-only worker can complete a replacement login. The
+// generation-owned replacement and migration are tracked by #4367.
 func CompleteOAuthSession(state string) {
 	internalmanagement.CompleteOAuthSession(state)
 }
 
-// CompleteOAuthSessionsByProvider removes all pending OAuth sessions for a provider.
+// CompleteOAuthSessionsByProvider completes pending logins for a provider, retaining explicit success.
 func CompleteOAuthSessionsByProvider(provider string) int {
 	return internalmanagement.CompleteOAuthSessionsByProvider(provider)
 }
 
-// GetOAuthSession returns the current OAuth session state.
+// GetOAuthSessionPhase exposes explicit retained lifecycle state for phase-aware callers.
+func GetOAuthSessionPhase(state string) (string, bool) {
+	return internalmanagement.GetOAuthSessionPhase(state)
+}
+
+// GetOAuthSession preserves the legacy pending/error getter; success is reported as no longer pending.
 func GetOAuthSession(state string) (provider string, status string, ok bool) {
 	return internalmanagement.GetOAuthSession(state)
 }

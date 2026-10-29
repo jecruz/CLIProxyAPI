@@ -311,10 +311,10 @@ func TestConvertOpenAIResponsesRequestToCodex_NormalizesTopLevelToolChoicePrevie
 }
 
 func TestUserFieldDeletion(t *testing.T) {
-	inputJSON := []byte(`{  
-		"model": "gpt-5.2",  
-		"user": "test-user",  
-		"input": [{"role": "user", "content": "Hello"}]  
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"user": "test-user",
+		"input": [{"role": "user", "content": "Hello"}]
 	}`)
 
 	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)

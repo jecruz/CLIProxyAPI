@@ -92,6 +92,26 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestRootEndpointUsesLLMDynamixBranding(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "LLM Dynamix Engine") {
+		t.Fatalf("root response missing LLM Dynamix branding: %s", body)
+	}
+	if strings.Contains(body, "CLI Proxy API Server") {
+		t.Fatalf("root response contains upstream branding: %s", body)
+	}
+}
+
 func TestNewServerWithPluginHostInjectsHandlerInterceptors(t *testing.T) {
 	host := pluginhost.New()
 	server := newTestServerWithOptions(t, WithPluginHost(host))
@@ -204,6 +224,39 @@ func TestManagementPluginsRouteRegistered(t *testing.T) {
 	}
 }
 
+func TestManagementStaticIconServesFromConfiguredStaticDirectory(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+
+	iconPath := filepath.Join(staticDir, "icon.png")
+	iconData := []byte{0x89, 0x50, 0x4E, 0x47}
+	if err := os.WriteFile(iconPath, iconData, 0o644); err != nil {
+		t.Fatalf("write icon fixture: %v", err)
+	}
+
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/icon.png", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Body.Bytes(); string(got) != string(iconData) {
+		t.Fatalf("body = %v, want %v", got, iconData)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/favicon.ico", nil)
+	rr = httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("favicon status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Body.Bytes(); string(got) != string(iconData) {
+		t.Fatalf("favicon body = %v, want %v", got, iconData)
+	}
+}
+
 func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
@@ -222,6 +275,24 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 
 	t.Run("management control panel returns 404", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+
+	t.Run("management static icon returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/icon.png", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+
+	t.Run("management static favicon returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/favicon.ico", nil)
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusNotFound {

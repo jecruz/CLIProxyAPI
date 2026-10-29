@@ -1,6 +1,7 @@
 package managementasset
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -58,5 +59,17 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 				t.Fatalf("autoUpdateSkipReason() = (%q, %t), want (%q, %t)", gotReason, gotSkip, tt.wantReason, tt.wantSkip)
 			}
 		})
+	}
+}
+
+func TestManagementAssetDefaultsUseLLMDynamixRepository(t *testing.T) {
+	if got := resolveReleaseURL(""); !strings.Contains(got, "api.github.com/repos/jecruz/llmdynamix/releases/latest") {
+		t.Fatalf("resolveReleaseURL(\"\") = %q, want LLM Dynamix releases API", got)
+	}
+	if strings.TrimSpace(defaultManagementFallbackURL) != "" {
+		t.Fatalf("defaultManagementFallbackURL = %q, want disabled fallback", defaultManagementFallbackURL)
+	}
+	if strings.Contains(httpUserAgent, "CLIProxyAPI") {
+		t.Fatalf("httpUserAgent = %q, leaked upstream product name", httpUserAgent)
 	}
 }

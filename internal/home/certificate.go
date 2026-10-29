@@ -120,7 +120,7 @@ func defaultCertificatePaths() (certificatePaths, error) {
 	if errHome != nil {
 		return certificatePaths{}, errHome
 	}
-	dir := filepath.Join(homeDir, ".cli-proxy-api")
+	dir := filepath.Join(homeDir, ".llmdynamix")
 	return certificatePaths{
 		Dir:        dir,
 		ClientCert: filepath.Join(dir, "client-crt.pem"),

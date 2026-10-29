@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -179,7 +180,7 @@ func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentTyp
 		t.Fatalf("write prompt field: %v", errWrite)
 	}
 	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "image.png"))
+	header.Set("Content-Disposition", util.FileContentDisposition("image", "image.png"))
 	header.Set("Content-Type", "image/png")
 	part, errCreate := writer.CreatePart(header)
 	if errCreate != nil {

@@ -382,7 +382,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || path == "/icon.png" || path == "/favicon.ico" {
 				c.Next()
 				return
 			}
@@ -411,6 +411,10 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/help.html", s.serveHelpPage)
+	s.engine.HEAD("/help.html", s.serveHelpPage)
+	s.engine.GET("/icon.png", s.serveManagementStaticIcon)
+	s.engine.GET("/favicon.ico", s.serveManagementStaticIcon)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -459,7 +463,7 @@ func (s *Server) setupRoutes() {
 	// Root endpoint
 	s.engine.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"message": "CLI Proxy API Server",
+			"message": "LLM Dynamix Engine",
 			"endpoints": []string{
 				"POST /v1/chat/completions",
 				"POST /v1/completions",
@@ -596,6 +600,15 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/config", s.mgmt.GetConfig)
+		mgmt.GET("/config/compare", s.mgmt.GetConfigCompare)
+		mgmt.GET("/diagnostics/model-review", s.mgmt.GetDiagnosticsModelReview)
+		mgmt.POST("/diagnostics/model-review/audit", s.mgmt.PostDiagnosticsModelReviewAudit)
+		mgmt.GET("/diagnostics/repair-actions", s.mgmt.GetDiagnosticsRepairActions)
+		mgmt.POST("/diagnostics/repair-actions/:id", s.mgmt.PostDiagnosticsRepairAction)
+		mgmt.GET("/provider-doctor", s.mgmt.GetProviderDoctor)
+		mgmt.POST("/provider-doctor/check", s.mgmt.CheckProviderRoute)
+		mgmt.POST("/provider-doctor/live-probe", s.mgmt.LiveProbeProvider)
+		mgmt.GET("/router-advisor", s.mgmt.GetRouterAdvisor)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
@@ -653,7 +666,9 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/logs", s.mgmt.GetLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
+		mgmt.GET("/request-traces", s.mgmt.GetRequestTraces)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
+		mgmt.GET("/request-error-logs/:name/review", s.mgmt.GetRequestErrorLogReview)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
 		mgmt.GET("/request-log-by-id/:id", s.mgmt.GetRequestLogByID)
 		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
@@ -750,6 +765,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+		mgmt.POST("/cancel-auth", s.mgmt.CancelAuth)
 	}
 }
 
@@ -873,6 +889,11 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	if _, err := os.Stat(filePath); err != nil {
 		if os.IsNotExist(err) {
+			if cfg.RemoteManagement.DisableAutoUpdatePanel {
+				log.Warn("management control panel asset is missing and auto-update is disabled")
+				c.AbortWithStatus(http.StatusNotFound)
+				return
+			}
 			// Synchronously ensure management.html is available with a detached context.
 			// Control panel bootstrap should not be canceled by client disconnects.
 			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
@@ -887,6 +908,63 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	}
 
 	c.File(filePath)
+}
+
+func (s *Server) serveManagementStaticIcon(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	staticDir := managementasset.StaticDir(s.configFilePath)
+	if strings.TrimSpace(staticDir) == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	filePath := filepath.Join(staticDir, "icon.png")
+	if _, err := os.Stat(filePath); err != nil {
+		if !os.IsNotExist(err) {
+			log.WithError(err).Error("failed to stat management static icon")
+		}
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	c.File(filePath)
+}
+
+// serveHelpPage serves the in-app help site bundled with the application. The
+// Swift host copies help.html into the runtime static directory at startup,
+// so this handler reads from that shared directory. It also falls back to
+// the configured auth directory's static folder in case the env-var override
+// points to a versioned subdirectory.
+func (s *Server) serveHelpPage(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	candidates := make([]string, 0, 4)
+	if dir := strings.TrimSpace(managementasset.StaticDir(s.configFilePath)); dir != "" {
+		candidates = append(candidates, filepath.Join(dir, "help.html"))
+		candidates = append(candidates, filepath.Join(filepath.Dir(dir), "help.html"))
+	}
+	if cfg.AuthDir != "" {
+		candidates = append(candidates, filepath.Join(cfg.AuthDir, "static", "help.html"))
+		candidates = append(candidates, filepath.Join(cfg.AuthDir, "help.html"))
+	}
+
+	for _, filePath := range candidates {
+		if _, err := os.Stat(filePath); err == nil {
+			c.File(filePath)
+			return
+		}
+	}
+
+	c.AbortWithStatus(http.StatusNotFound)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

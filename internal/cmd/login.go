@@ -146,7 +146,8 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 		for _, candidateID := range projectSelections {
 			log.Infof("Activating project %s", candidateID)
 			if errSetup := performGeminiCLISetup(ctx, httpClient, storage, candidateID); errSetup != nil {
-				if _, ok := errors.AsType[*projectSelectionRequiredError](errSetup); ok {
+				var projectSelectionErr *projectSelectionRequiredError
+				if errors.As(errSetup, &projectSelectionErr) && projectSelectionErr != nil {
 					log.Error("Failed to start user onboarding: A project ID is required.")
 					showProjectSelectionHelp(storage.Email, projects)
 					return

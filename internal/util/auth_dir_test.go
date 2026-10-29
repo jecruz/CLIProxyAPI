@@ -1,0 +1,21 @@
+package util
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+func TestResolveAuthDirDefaultsToLLMDynamixDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	got, err := ResolveAuthDir("")
+	if err != nil {
+		t.Fatalf("ResolveAuthDir(\"\") error = %v", err)
+	}
+
+	want := filepath.Join(home, ".llmdynamix")
+	if got != want {
+		t.Fatalf("ResolveAuthDir(\"\") = %q, want %q", got, want)
+	}
+}

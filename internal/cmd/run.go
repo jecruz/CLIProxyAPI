@@ -18,6 +18,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const localManagementKeepAliveTimeout = 24 * time.Hour
+
 // StartService builds and runs the proxy service using the exported SDK.
 // It creates a new proxy service instance, sets up signal handling for graceful shutdown,
 // and starts the service with the provided configuration.
@@ -47,8 +49,8 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 	if localPassword != "" {
 		var keepAliveCancel context.CancelFunc
 		runCtx, keepAliveCancel = context.WithCancel(ctxSignal)
-		builder = builder.WithServerOptions(api.WithKeepAliveEndpoint(10*time.Second, func() {
-			log.Warn("keep-alive endpoint idle for 10s, shutting down")
+		builder = builder.WithServerOptions(api.WithKeepAliveEndpoint(localManagementKeepAliveTimeout, func() {
+			log.Warnf("keep-alive endpoint idle for %s, shutting down", localManagementKeepAliveTimeout)
 			keepAliveCancel()
 		}))
 	}

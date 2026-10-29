@@ -1,10 +1,58 @@
 package main
 
 import (
+	"os"
+	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
+
+func TestLoadManagementPasswordFromFileRemovesSecretFile(t *testing.T) {
+	secretFile, err := os.CreateTemp(t.TempDir(), "management-secret-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secretFile.WriteString("file-management-secret\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secretFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("MANAGEMENT_PASSWORD_FILE", secretFile.Name())
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	got := loadManagementPasswordFromEnvironment()
+	if got != "file-management-secret" {
+		t.Fatalf("loadManagementPasswordFromEnvironment() = %q, want file secret", got)
+	}
+	if _, err := os.Stat(secretFile.Name()); !os.IsNotExist(err) {
+		t.Fatalf("secret file still exists, stat error = %v", err)
+	}
+}
+
+func TestVersionLineUsesLLMDynamixProductName(t *testing.T) {
+	oldVersion, oldCommit, oldBuildDate := buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate
+	t.Cleanup(func() {
+		buildinfo.Version = oldVersion
+		buildinfo.Commit = oldCommit
+		buildinfo.BuildDate = oldBuildDate
+	})
+
+	buildinfo.Version = "1.2.3"
+	buildinfo.Commit = "abc123"
+	buildinfo.BuildDate = "2026-06-13T00:00:00Z"
+
+	got := versionLine()
+	if !strings.Contains(got, "LLM Dynamix Engine Version: 1.2.3") {
+		t.Fatalf("versionLine() = %q, want LLM Dynamix product name", got)
+	}
+	if strings.Contains(got, "CLIProxyAPI Version") {
+		t.Fatalf("versionLine() = %q, leaked upstream product name", got)
+	}
+}
 
 func TestShouldStartExampleAPIKeyWarningServer(t *testing.T) {
 	cfgWithExampleKey := &config.Config{

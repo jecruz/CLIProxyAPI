@@ -14,6 +14,7 @@ import (
 )
 
 func TestPostOAuthCallbackCreatesMissingAuthDir(t *testing.T) {
+	isolateOAuthSessions(t)
 	gin.SetMode(gin.TestMode)
 
 	authDir := filepath.Join(t.TempDir(), "missing-auth")
@@ -52,6 +53,7 @@ func TestPostOAuthCallbackCreatesMissingAuthDir(t *testing.T) {
 }
 
 func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
+	isolateOAuthSessions(t)
 	providers := []string{"anthropic", "codex", "gemini", "antigravity", "xai"}
 	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {

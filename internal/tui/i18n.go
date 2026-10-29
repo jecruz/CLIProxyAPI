@@ -235,7 +235,7 @@ var enStrings = map[string]string{
 	"error_prefix": "⚠ Error: ",
 
 	// ── Status bar ──
-	"status_left":                 " CLIProxyAPI Management TUI",
+	"status_left":                 " LLM Dynamix Engine Management TUI",
 	"status_right":                "Tab/Shift+Tab: switch • L: lang • q/Ctrl+C: quit ",
 	"initializing_tui":            "Initializing...",
 	"auth_gate_title":             "🔐 Connect Management API",

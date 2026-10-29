@@ -18,6 +18,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -518,7 +519,7 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 				continue
 			}
 			header := cloneMIMEHeader(fileHeader.Header)
-			header.Set("Content-Disposition", multipart.FileContentDisposition(key, fileHeader.Filename))
+			header.Set("Content-Disposition", util.FileContentDisposition(key, fileHeader.Filename))
 			if header.Get("Content-Type") == "" {
 				header.Set("Content-Type", "application/octet-stream")
 			}

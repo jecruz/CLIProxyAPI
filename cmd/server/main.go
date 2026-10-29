@@ -42,6 +42,7 @@ var (
 	Version           = "dev"
 	Commit            = "none"
 	BuildDate         = "unknown"
+	ProductName       = "LLM Dynamix Engine"
 	DefaultConfigPath = ""
 )
 
@@ -63,11 +64,30 @@ func shouldStartExampleAPIKeyWarningServer(cfg *config.Config, commandMode, tuiM
 	return safemode.HasExampleAPIKeys(cfg.APIKeys)
 }
 
+func versionLine() string {
+	return fmt.Sprintf("%s Version: %s, Commit: %s, BuiltAt: %s", ProductName, buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+}
+
+// loadManagementPasswordFromEnvironment reads the startup secret from a protected
+// handoff file, removes that file, and retains the legacy environment fallback.
+func loadManagementPasswordFromEnvironment() string {
+	secretPath := strings.TrimSpace(os.Getenv("MANAGEMENT_PASSWORD_FILE"))
+	if secretPath != "" {
+		secret, err := os.ReadFile(secretPath)
+		_ = os.Remove(secretPath)
+		_ = os.Unsetenv("MANAGEMENT_PASSWORD_FILE")
+		if err == nil && strings.TrimSpace(string(secret)) != "" {
+			return strings.TrimSpace(string(secret))
+		}
+	}
+	return strings.TrimSpace(os.Getenv("MANAGEMENT_PASSWORD"))
+}
+
 // main is the entry point of the application.
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
 func main() {
-	fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	fmt.Println(versionLine())
 
 	// Command-line flags to control the application's behavior.
 	var login bool
@@ -146,6 +166,9 @@ func main() {
 
 	// Parse the command-line flags.
 	flag.Parse()
+	if password == "" {
+		password = loadManagementPasswordFromEnvironment()
+	}
 
 	// Core application variables.
 	var err error
@@ -301,7 +324,7 @@ func main() {
 			parsed = &config.Config{}
 		}
 		parsed.Home = homeCfg
-		parsed.Port = 8317 // Default to 8317 for home mode, can be overridden by home config
+		parsed.Port = 12445 // Default to the LLM Dynamix backend port for home mode; home config can override it.
 		parsed.UsageStatisticsEnabled = true
 		cfg = parsed
 
@@ -511,7 +534,7 @@ func main() {
 		return
 	}
 
-	log.Infof("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	log.Info(versionLine())
 
 	// Set the log level based on the configuration.
 	util.SetLogLevel(cfg)

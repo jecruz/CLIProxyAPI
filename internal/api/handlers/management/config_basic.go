@@ -13,14 +13,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	latestReleaseURL       = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
-	latestReleaseUserAgent = "CLIProxyAPI"
+	latestReleaseURL       = "https://api.github.com/repos/jecruz/llmdynamix/releases/latest"
+	latestReleaseUserAgent = "LLM Dynamix Engine"
 )
 
 func (h *Handler) GetConfig(c *gin.Context) {
@@ -28,7 +29,164 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		c.JSON(200, gin.H{})
 		return
 	}
-	c.JSON(200, new(*h.cfg))
+
+	cfgCopy := *h.cfg
+	c.JSON(200, struct {
+		*config.Config
+		ProviderCounts          map[string]providerCountSummary `json:"provider-counts,omitempty"`
+		Runtime                 runtimeSummary                  `json:"runtime,omitempty"`
+		ManagementKeyConfigured bool                            `json:"managementKeyConfigured"`
+	}{
+		Config:                  &cfgCopy,
+		ProviderCounts:          h.liveProviderCounts(),
+		Runtime:                 h.runtimeSummary(),
+		ManagementKeyConfigured: strings.TrimSpace(h.cfg.RemoteManagement.SecretKey) != "" || strings.TrimSpace(h.envSecret) != "",
+	})
+}
+
+type providerCountSummary struct {
+	Total  int `json:"total"`
+	Active int `json:"active"`
+}
+
+type runtimeSummary struct {
+	StartedAt     string `json:"startedAt"`
+	UptimeSeconds int64  `json:"uptimeSeconds"`
+	Uptime        string `json:"uptime"`
+}
+
+func (h *Handler) runtimeSummary() runtimeSummary {
+	if h == nil || h.startedAt.IsZero() {
+		return runtimeSummary{}
+	}
+	now := time.Now().UTC()
+	uptime := now.Sub(h.startedAt)
+	if uptime < 0 {
+		uptime = 0
+	}
+	return runtimeSummary{
+		StartedAt:     h.startedAt.Format(time.RFC3339),
+		UptimeSeconds: int64(uptime.Seconds()),
+		Uptime:        formatRuntimeUptime(uptime),
+	}
+}
+
+func formatRuntimeUptime(duration time.Duration) string {
+	totalSeconds := int64(duration.Round(time.Second).Seconds())
+	if totalSeconds < 0 {
+		totalSeconds = 0
+	}
+	days := totalSeconds / 86400
+	totalSeconds %= 86400
+	hours := totalSeconds / 3600
+	totalSeconds %= 3600
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
+	case hours > 0:
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	case minutes > 0:
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	default:
+		return fmt.Sprintf("%ds", seconds)
+	}
+}
+
+func (h *Handler) liveProviderCounts() map[string]providerCountSummary {
+	counts := map[string]providerCountSummary{}
+	if h != nil && h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			family := providerFamilyForAuth(auth)
+			if family == "" {
+				continue
+			}
+			summary := counts[family]
+			summary.Total++
+			if auth != nil && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+				summary.Active++
+			}
+			counts[family] = summary
+		}
+	}
+	if len(counts) > 0 {
+		return counts
+	}
+	if h == nil || h.cfg == nil {
+		return counts
+	}
+
+	add := func(key string, total, active int) {
+		if total <= 0 {
+			return
+		}
+		counts[key] = providerCountSummary{Total: total, Active: active}
+	}
+
+	add("gemini", len(h.cfg.GeminiKey), len(h.cfg.GeminiKey))
+	add("codex", len(h.cfg.CodexKey), len(h.cfg.CodexKey))
+	add("claude", len(h.cfg.ClaudeKey), len(h.cfg.ClaudeKey))
+	add("vertex", len(h.cfg.VertexCompatAPIKey), len(h.cfg.VertexCompatAPIKey))
+
+	openAIActive := 0
+	for i := range h.cfg.OpenAICompatibility {
+		if !h.cfg.OpenAICompatibility[i].Disabled {
+			openAIActive++
+		}
+	}
+	add("openaiCompatibility", len(h.cfg.OpenAICompatibility), openAIActive)
+
+	return counts
+}
+
+func providerFamilyForAuth(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+
+	provider := providerFamilyFromProviderToken(auth.Provider)
+	if provider != "" {
+		return provider
+	}
+
+	if metadataType, ok := auth.Metadata["type"].(string); ok {
+		provider := providerFamilyFromProviderToken(metadataType)
+		if provider != "" {
+			return provider
+		}
+	}
+
+	compatName := strings.TrimSpace(auth.Attributes["compat_name"])
+	providerKey := strings.TrimSpace(auth.Attributes["provider_key"])
+	if compatName != "" || providerKey != "" {
+		return "openaiCompatibility"
+	}
+
+	return ""
+}
+
+func providerFamilyFromProviderToken(rawProvider string) string {
+	provider := strings.ToLower(strings.TrimSpace(rawProvider))
+	if provider == "" {
+		return ""
+	}
+
+	switch provider {
+	case "gemini", "gemini-cli":
+		return "gemini"
+	case "codex":
+		return "codex"
+	case "claude", "anthropic":
+		return "claude"
+	case "vertex":
+		return "vertex"
+	case "openai-compatibility", "openrouter":
+		return "openaiCompatibility"
+	}
+
+	return ""
 }
 
 type releaseInfo struct {

@@ -35,6 +35,13 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("parse config payload: %w", err)
 	}
 
+	var legacy legacyConfigData
+	if errLegacy := yaml.Unmarshal(data, &legacy); errLegacy == nil {
+		_ = cfg.migrateLegacyGeminiKeys(legacy.LegacyGeminiKeys)
+		_ = cfg.migrateLegacyOpenAICompatibilityKeys(legacy.OpenAICompat)
+		_ = cfg.migrateLegacyAmpConfig(&legacy)
+	}
+
 	// Hash remote management key if plaintext is detected (nested), but do NOT persist.
 	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
 		hashed, errHash := bcrypt.GenerateFromPassword([]byte(cfg.RemoteManagement.SecretKey), bcrypt.DefaultCost)

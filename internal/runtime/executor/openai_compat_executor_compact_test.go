@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -228,7 +229,7 @@ func TestOpenAICompatExecutorImagesEditsMultipartRewritesModel(t *testing.T) {
 		t.Fatalf("write prompt field: %v", errWrite)
 	}
 	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "image.png"))
+	header.Set("Content-Disposition", util.FileContentDisposition("image", "image.png"))
 	header.Set("Content-Type", "image/png")
 	part, errCreate := writer.CreatePart(header)
 	if errCreate != nil {
@@ -320,7 +321,7 @@ func TestRewriteOpenAICompatImagesMultipartPayloadPreservesStreamAndFileContentT
 		t.Fatalf("write stream field: %v", errWrite)
 	}
 	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "image.webp"))
+	header.Set("Content-Disposition", util.FileContentDisposition("image", "image.webp"))
 	header.Set("Content-Type", "image/webp")
 	part, errCreate := writer.CreatePart(header)
 	if errCreate != nil {

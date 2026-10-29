@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/jecruz/llmdynamix"
 	DefaultPprofAddr             = "127.0.0.1:8316"
-	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultAuthDir               = "~/.llmdynamix"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -752,21 +752,18 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// NOTE: Startup legacy key migration is intentionally disabled.
-	// Reason: avoid mutating config.yaml during server startup.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// var legacy legacyConfigData
-	// if errLegacy := yaml.Unmarshal(data, &legacy); errLegacy == nil {
-	// 	if cfg.migrateLegacyGeminiKeys(legacy.LegacyGeminiKeys) {
-	// 		cfg.legacyMigrationPending = true
-	// 	}
-	// 	if cfg.migrateLegacyOpenAICompatibilityKeys(legacy.OpenAICompat) {
-	// 		cfg.legacyMigrationPending = true
-	// 	}
-	// 	if cfg.migrateLegacyAmpConfig(&legacy) {
-	// 		cfg.legacyMigrationPending = true
-	// 	}
-	// }
+	var legacy legacyConfigData
+	if errLegacy := yaml.Unmarshal(data, &legacy); errLegacy == nil {
+		if cfg.migrateLegacyGeminiKeys(legacy.LegacyGeminiKeys) {
+			cfg.legacyMigrationPending = true
+		}
+		if cfg.migrateLegacyOpenAICompatibilityKeys(legacy.OpenAICompat) {
+			cfg.legacyMigrationPending = true
+		}
+		if cfg.migrateLegacyAmpConfig(&legacy) {
+			cfg.legacyMigrationPending = true
+		}
+	}
 
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -843,20 +840,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
-	// NOTE: Legacy migration persistence is intentionally disabled together with
-	// startup legacy migration to keep startup read-only for config.yaml.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// if cfg.legacyMigrationPending {
-	// 	fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
-	// 	if !optional && configFile != "" {
-	// 		if err := SaveConfigPreserveComments(configFile, &cfg); err != nil {
-	// 			return nil, fmt.Errorf("failed to persist migrated legacy config: %w", err)
-	// 		}
-	// 		fmt.Println("Legacy configuration normalized and persisted.")
-	// 	} else {
-	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
-	// 	}
-	// }
+	if cfg.legacyMigrationPending {
+		fmt.Println("Detected legacy configuration keys; normalized in memory.")
+	}
 
 	// Return the populated configuration struct.
 	return &cfg, nil
@@ -1213,9 +1199,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 		return fmt.Errorf("expected generated root mapping node")
 	}
 
-	// Remove deprecated sections before merging back the sanitized config.
+	// Remove or migrate deprecated sections before merging back the sanitized config.
 	removeLegacyAuthBlock(original.Content[0])
-	removeLegacyOpenAICompatAPIKeys(original.Content[0])
+	migrateLegacyOpenAICompatAPIKeys(original.Content[0], generated.Content[0])
 	removeLegacyAmpKeys(original.Content[0])
 	removeLegacyGenerativeLanguageKeys(original.Content[0])
 
@@ -2040,23 +2026,171 @@ func (cfg *Config) migrateLegacyAmpConfig(legacy *legacyConfigData) bool {
 	return changed
 }
 
-func removeLegacyOpenAICompatAPIKeys(root *yaml.Node) {
-	if root == nil || root.Kind != yaml.MappingNode {
+func migrateLegacyOpenAICompatAPIKeys(originalRoot, generatedRoot *yaml.Node) {
+	if originalRoot == nil || generatedRoot == nil {
 		return
 	}
-	idx := findMapKeyIndex(root, "openai-compatibility")
-	if idx < 0 || idx+1 >= len(root.Content) {
+	if originalRoot.Kind != yaml.MappingNode || generatedRoot.Kind != yaml.MappingNode {
 		return
 	}
-	seq := root.Content[idx+1]
-	if seq == nil || seq.Kind != yaml.SequenceNode {
+	originalIdx := findMapKeyIndex(originalRoot, "openai-compatibility")
+	generatedIdx := findMapKeyIndex(generatedRoot, "openai-compatibility")
+	if originalIdx < 0 || originalIdx+1 >= len(originalRoot.Content) {
 		return
 	}
-	for i := range seq.Content {
-		if seq.Content[i] != nil && seq.Content[i].Kind == yaml.MappingNode {
-			removeMapKey(seq.Content[i], "api-keys")
+	originalSeq := originalRoot.Content[originalIdx+1]
+	if originalSeq == nil || originalSeq.Kind != yaml.SequenceNode {
+		return
+	}
+	var generatedSeq *yaml.Node
+	if generatedIdx >= 0 && generatedIdx+1 < len(generatedRoot.Content) {
+		generatedSeq = generatedRoot.Content[generatedIdx+1]
+	}
+	for i := range originalSeq.Content {
+		entry := originalSeq.Content[i]
+		if entry == nil || entry.Kind != yaml.MappingNode {
+			continue
+		}
+
+		legacyKeys := legacyAPIKeyEntriesFromNode(entry)
+		if len(legacyKeys) == 0 {
+			removeMapKey(entry, "api-keys")
+			continue
+		}
+
+		if target := findOpenAICompatEntryNode(generatedSeq, entry); target != nil {
+			migrateLegacyOpenAICompatAPIKeysInEntry(target, legacyKeys)
+		}
+		removeMapKey(entry, "api-keys")
+	}
+}
+
+func migrateLegacyOpenAICompatAPIKeysInEntry(entry *yaml.Node, legacyKeys []string) {
+	if entry == nil || entry.Kind != yaml.MappingNode || len(legacyKeys) == 0 {
+		return
+	}
+	existingIdx := findMapKeyIndex(entry, "api-key-entries")
+	if existingIdx < 0 || existingIdx+1 >= len(entry.Content) {
+		entry.Content = append(entry.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "api-key-entries"}, legacyAPIKeyEntriesNode(legacyKeys))
+		return
+	}
+
+	existingNode := entry.Content[existingIdx+1]
+	if existingNode == nil || existingNode.Kind != yaml.SequenceNode {
+		entry.Content[existingIdx+1] = legacyAPIKeyEntriesNode(legacyKeys)
+		return
+	}
+
+	existingKeys := make(map[string]struct{}, len(existingNode.Content))
+	for _, child := range existingNode.Content {
+		if key := apiKeyEntryNodeValue(child); key != "" {
+			existingKeys[key] = struct{}{}
 		}
 	}
+	for _, key := range legacyKeys {
+		if _, exists := existingKeys[key]; exists {
+			continue
+		}
+		existingNode.Content = append(existingNode.Content, legacyAPIKeyEntryNode(key))
+		existingKeys[key] = struct{}{}
+	}
+}
+
+func legacyAPIKeyEntriesFromNode(node *yaml.Node) []string {
+	if node == nil || node.Kind != yaml.SequenceNode {
+		return nil
+	}
+	keys := make([]string, 0, len(node.Content))
+	for _, child := range node.Content {
+		if child == nil || child.Kind != yaml.ScalarNode {
+			continue
+		}
+		key := strings.TrimSpace(child.Value)
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func findOpenAICompatEntryNode(seq *yaml.Node, legacyEntry *yaml.Node) *yaml.Node {
+	if seq == nil || seq.Kind != yaml.SequenceNode || legacyEntry == nil || legacyEntry.Kind != yaml.MappingNode {
+		return nil
+	}
+
+	legacyName := ""
+	if idx := findMapKeyIndex(legacyEntry, "name"); idx >= 0 && idx+1 < len(legacyEntry.Content) {
+		legacyName = strings.ToLower(strings.TrimSpace(legacyEntry.Content[idx+1].Value))
+	}
+	legacyBase := ""
+	if idx := findMapKeyIndex(legacyEntry, "base-url"); idx >= 0 && idx+1 < len(legacyEntry.Content) {
+		legacyBase = strings.ToLower(strings.TrimSpace(legacyEntry.Content[idx+1].Value))
+	}
+
+	for _, candidate := range seq.Content {
+		if candidate == nil || candidate.Kind != yaml.MappingNode {
+			continue
+		}
+
+		candidateName := ""
+		if idx := findMapKeyIndex(candidate, "name"); idx >= 0 && idx+1 < len(candidate.Content) {
+			candidateName = strings.ToLower(strings.TrimSpace(candidate.Content[idx+1].Value))
+		}
+		candidateBase := ""
+		if idx := findMapKeyIndex(candidate, "base-url"); idx >= 0 && idx+1 < len(candidate.Content) {
+			candidateBase = strings.ToLower(strings.TrimSpace(candidate.Content[idx+1].Value))
+		}
+
+		if legacyName != "" && legacyBase != "" {
+			if legacyName == candidateName && legacyBase == candidateBase {
+				return candidate
+			}
+			continue
+		}
+		if legacyBase != "" && legacyBase == candidateBase {
+			return candidate
+		}
+		if legacyName != "" && legacyName == candidateName {
+			return candidate
+		}
+	}
+
+	return nil
+}
+
+func legacyAPIKeyEntriesNode(keys []string) *yaml.Node {
+	entries := make([]*yaml.Node, 0, len(keys))
+	for _, key := range keys {
+		entries = append(entries, legacyAPIKeyEntryNode(key))
+	}
+	return &yaml.Node{
+		Kind:    yaml.SequenceNode,
+		Tag:     "!!seq",
+		Content: entries,
+	}
+}
+
+func legacyAPIKeyEntryNode(key string) *yaml.Node {
+	return &yaml.Node{
+		Kind: yaml.MappingNode,
+		Tag:  "!!map",
+		Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "api-key"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		},
+	}
+}
+
+func apiKeyEntryNodeValue(node *yaml.Node) string {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return ""
+	}
+	idx := findMapKeyIndex(node, "api-key")
+	if idx < 0 || idx+1 >= len(node.Content) {
+		return ""
+	}
+	return strings.TrimSpace(node.Content[idx+1].Value)
 }
 
 func removeLegacyAmpKeys(root *yaml.Node) {

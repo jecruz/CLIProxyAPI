@@ -699,7 +699,7 @@ func rewriteOpenAICompatImagesMultipartPayload(payload []byte, model string, bou
 				continue
 			}
 			header := cloneOpenAICompatMIMEHeader(fileHeader.Header)
-			header.Set("Content-Disposition", multipart.FileContentDisposition(key, fileHeader.Filename))
+			header.Set("Content-Disposition", util.FileContentDisposition(key, fileHeader.Filename))
 			if header.Get("Content-Type") == "" {
 				header.Set("Content-Type", "application/octet-stream")
 			}

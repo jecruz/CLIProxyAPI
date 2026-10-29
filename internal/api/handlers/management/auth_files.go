@@ -303,12 +303,13 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid oauth state"})
 		return true
 	}
-	if errRegister := RegisterPluginOAuthSession(state, provider, resp.Metadata); errRegister != nil {
+	owner, errRegister := oauthSessions.RegisterPluginContext(state, provider, resp.Metadata, resp.ExpiresAt)
+	if errRegister != nil {
 		log.WithError(errRegister).WithField("provider", provider).Error("failed to register plugin oauth session")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to generate authorization url"})
 		return true
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": resp.URL, "state": state})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": resp.URL, "state": state, "attempt_token": oauthAttemptToken(owner)})
 	return true
 }
 
@@ -1681,7 +1682,8 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	return store
 }
 
-func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+// persistTokenRecord runs pre-save validation and the credential store's commit.
+func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
@@ -1694,16 +1696,39 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	savedPath, errSave := store.Save(ctx, record)
-	if errSave != nil {
-		return "", errSave
+	return store.Save(ctx, record)
+}
+
+func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	path, err := h.persistTokenRecord(ctx, record)
+	if err != nil {
+		return path, err
 	}
 	if h.postAuthPersistHook != nil {
-		if errHook := h.postAuthPersistHook(ctx, record); errHook != nil {
-			return savedPath, fmt.Errorf("post-auth persist hook failed: %w", errHook)
+		if err := h.postAuthPersistHook(ctx, record); err != nil {
+			return path, fmt.Errorf("post-auth persist hook failed: %w", err)
 		}
 	}
-	return savedPath, nil
+	return path, nil
+}
+
+// saveOAuthTokenRecord finalizes success at Store.Save; later hooks cannot relabel it.
+func (h *Handler) saveOAuthTokenRecord(owner context.Context, state string, record *coreauth.Auth) (string, error) {
+	var commitContext context.Context
+	path, err := oauthSessions.Commit(state, owner, func(ctx context.Context) (string, error) {
+		commitContext = ctx
+		return h.persistTokenRecord(ctx, record)
+	})
+	if err != nil {
+		return path, err
+	}
+	if h.postAuthPersistHook != nil {
+		if hookErr := h.postAuthPersistHook(commitContext, record); hookErr != nil {
+			// Do not log hook payloads, which may contain provider credential data.
+			log.Warn("OAuth credential saved; post-persistence hook failed")
+		}
+	}
+	return path, nil
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
@@ -1739,7 +1764,12 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	RegisterOAuthSession(state, "anthropic")
+	var errSession error
+	ctx, errSession = oauthSessions.RegisterContext(state, "anthropic", ctx, 5*time.Minute)
+	if errSession != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start authentication session"})
+		return
+	}
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -1747,12 +1777,14 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		targetURL, errTarget := h.managementCallbackURL("/anthropic/callback")
 		if errTarget != nil {
 			log.WithError(errTarget).Error("failed to compute anthropic callback target")
+			oauthSessions.SetErrorContext(state, ctx, "Callback server unavailable")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(anthropicCallbackPort, "anthropic", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start anthropic callback forwarder")
+			oauthSessions.SetErrorContext(state, ctx, "Could not start callback server")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
 		}
@@ -1765,6 +1797,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		// Helper: wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
+		defer os.Remove(waitFile)
 		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
 			deadline := time.Now().Add(timeout)
 			for {
@@ -1772,7 +1805,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 					return nil, errOAuthSessionNotPending
 				}
 				if time.Now().After(deadline) {
-					SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
+					oauthSessions.SetErrorContext(state, ctx, "Timeout waiting for OAuth callback")
 					return nil, fmt.Errorf("timeout waiting for OAuth callback")
 				}
 				data, errRead := os.ReadFile(path)
@@ -1782,7 +1815,11 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 					_ = os.Remove(path)
 					return m, nil
 				}
-				time.Sleep(500 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return nil, errOAuthSessionNotPending
+				case <-time.After(500 * time.Millisecond):
+				}
 			}
 		}
 
@@ -1800,13 +1837,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		if errStr := resultMap["error"]; errStr != "" {
 			oauthErr := claude.NewOAuthError(errStr, "", http.StatusBadRequest)
 			log.Error(claude.GetUserFriendlyMessage(oauthErr))
-			SetOAuthSessionError(state, "Bad request")
+			oauthSessions.SetErrorContext(state, ctx, "Bad request")
 			return
 		}
 		if resultMap["state"] != state {
 			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, resultMap["state"]))
 			log.Error(claude.GetUserFriendlyMessage(authErr))
-			SetOAuthSessionError(state, "State code error")
+			oauthSessions.SetErrorContext(state, ctx, "State code error")
 			return
 		}
 
@@ -1819,7 +1856,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to exchange authorization code for tokens")
 			return
 		}
 
@@ -1832,10 +1869,10 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: map[string]any{"email": tokenStorage.Email},
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to save authentication tokens")
 			return
 		}
 
@@ -1844,11 +1881,10 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Claude services through this CLI")
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("anthropic")
+		oauthSessions.CompleteContext(state, ctx)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "attempt_token": oauthAttemptToken(ctx)})
 }
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
@@ -1875,7 +1911,12 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
 	authURL := conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
 
-	RegisterOAuthSession(state, "gemini")
+	var errSession error
+	ctx, errSession = oauthSessions.RegisterContext(state, "gemini", ctx, 5*time.Minute)
+	if errSession != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start authentication session"})
+		return
+	}
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -1883,12 +1924,14 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		targetURL, errTarget := h.managementCallbackURL("/google/callback")
 		if errTarget != nil {
 			log.WithError(errTarget).Error("failed to compute gemini callback target")
+			oauthSessions.SetErrorContext(state, ctx, "Callback server unavailable")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(geminiCallbackPort, "gemini", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start gemini callback forwarder")
+			oauthSessions.SetErrorContext(state, ctx, "Could not start callback server")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
 		}
@@ -1901,6 +1944,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 
 		// Wait for callback file written by server route
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gemini-%s.oauth", state))
+		defer os.Remove(waitFile)
 		fmt.Println("Waiting for authentication callback...")
 		deadline := time.Now().Add(5 * time.Minute)
 		var authCode string
@@ -1910,7 +1954,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			}
 			if time.Now().After(deadline) {
 				log.Error("oauth flow timed out")
-				SetOAuthSessionError(state, "OAuth flow timed out")
+				oauthSessions.SetErrorContext(state, ctx, "OAuth flow timed out")
 				return
 			}
 			if data, errR := os.ReadFile(waitFile); errR == nil {
@@ -1919,25 +1963,29 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 				_ = os.Remove(waitFile)
 				if errStr := m["error"]; errStr != "" {
 					log.Errorf("Authentication failed: %s", errStr)
-					SetOAuthSessionError(state, "Authentication failed")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed")
 					return
 				}
 				authCode = m["code"]
 				if authCode == "" {
 					log.Errorf("Authentication failed: code not found")
-					SetOAuthSessionError(state, "Authentication failed: code not found")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed: code not found")
 					return
 				}
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 
 		// Exchange authorization code for token
 		token, err := conf.Exchange(ctx, authCode)
 		if err != nil {
 			log.Errorf("Failed to exchange token: %v", err)
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to exchange token")
 			return
 		}
 
@@ -1948,7 +1996,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		req, errNewRequest := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
 		if errNewRequest != nil {
 			log.Errorf("Could not get user info: %v", errNewRequest)
-			SetOAuthSessionError(state, "Could not get user info")
+			oauthSessions.SetErrorContext(state, ctx, "Could not get user info")
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -1957,7 +2005,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		resp, errDo := authHTTPClient.Do(req)
 		if errDo != nil {
 			log.Errorf("Failed to execute request: %v", errDo)
-			SetOAuthSessionError(state, "Failed to execute request")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to execute request")
 			return
 		}
 		defer func() {
@@ -1969,7 +2017,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			log.Errorf("Get user info request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-			SetOAuthSessionError(state, fmt.Sprintf("Get user info request failed with status %d", resp.StatusCode))
+			oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Get user info request failed with status %d", resp.StatusCode))
 			return
 		}
 
@@ -1985,7 +2033,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		jsonData, _ := json.Marshal(token)
 		if errUnmarshal := json.Unmarshal(jsonData, &ifToken); errUnmarshal != nil {
 			log.Errorf("Failed to unmarshal token: %v", errUnmarshal)
-			SetOAuthSessionError(state, "Failed to unmarshal token")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to unmarshal token")
 			return
 		}
 
@@ -2009,7 +2057,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		})
 		if errGetClient != nil {
 			log.Errorf("failed to get authenticated client: %v", errGetClient)
-			SetOAuthSessionError(state, "Failed to get authenticated client")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to get authenticated client")
 			return
 		}
 		fmt.Println("Authentication successful.")
@@ -2019,12 +2067,12 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &ts)
 			if errAll != nil {
 				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errAll))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errAll))
 				return
 			}
 			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
 				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errVerify))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errVerify))
 				return
 			}
 			ts.ProjectID = strings.Join(projects, ",")
@@ -2033,49 +2081,49 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			ts.Auto = false
 			if errSetup := performGeminiCLISetup(ctx, gemClient, &ts, ""); errSetup != nil {
 				log.Errorf("Google One auto-discovery failed: %v", errSetup)
-				SetOAuthSessionError(state, fmt.Sprintf("Google One auto-discovery failed: %v", errSetup))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Google One auto-discovery failed: %v", errSetup))
 				return
 			}
 			if strings.TrimSpace(ts.ProjectID) == "" {
 				log.Error("Google One auto-discovery returned empty project ID")
-				SetOAuthSessionError(state, "Google One auto-discovery returned empty project ID")
+				oauthSessions.SetErrorContext(state, ctx, "Google One auto-discovery returned empty project ID")
 				return
 			}
 			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
 			if errCheck != nil {
 				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
 				return
 			}
 			ts.Checked = isChecked
 			if !isChecked {
 				log.Error("Cloud AI API is not enabled for the auto-discovered project")
-				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
 				return
 			}
 		} else {
 			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
 				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errEnsure))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errEnsure))
 				return
 			}
 
 			if strings.TrimSpace(ts.ProjectID) == "" {
 				log.Error("Onboarding did not return a project ID")
-				SetOAuthSessionError(state, "Failed to resolve project ID")
+				oauthSessions.SetErrorContext(state, ctx, "Failed to resolve project ID")
 				return
 			}
 
 			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
 			if errCheck != nil {
 				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
 				return
 			}
 			ts.Checked = isChecked
 			if !isChecked {
 				log.Error("Cloud AI API is not enabled for the selected project")
-				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
+				oauthSessions.SetErrorContext(state, ctx, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
 				return
 			}
 		}
@@ -2095,19 +2143,18 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			Storage:  &ts,
 			Metadata: recordMetadata,
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to save token to file")
 			return
 		}
 
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("gemini")
+		oauthSessions.CompleteContext(state, ctx)
 		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "attempt_token": oauthAttemptToken(ctx)})
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {
@@ -2143,7 +2190,12 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
-	RegisterOAuthSession(state, "codex")
+	var errSession error
+	ctx, errSession = oauthSessions.RegisterContext(state, "codex", ctx, 5*time.Minute)
+	if errSession != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start authentication session"})
+		return
+	}
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -2151,12 +2203,14 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		targetURL, errTarget := h.managementCallbackURL("/codex/callback")
 		if errTarget != nil {
 			log.WithError(errTarget).Error("failed to compute codex callback target")
+			oauthSessions.SetErrorContext(state, ctx, "Callback server unavailable")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(codexCallbackPort, "codex", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start codex callback forwarder")
+			oauthSessions.SetErrorContext(state, ctx, "Could not start callback server")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
 		}
@@ -2169,6 +2223,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 		// Wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
+		defer os.Remove(waitFile)
 		deadline := time.Now().Add(5 * time.Minute)
 		var code string
 		for {
@@ -2178,7 +2233,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			if time.Now().After(deadline) {
 				authErr := codex.NewAuthenticationError(codex.ErrCallbackTimeout, fmt.Errorf("timeout waiting for OAuth callback"))
 				log.Error(codex.GetUserFriendlyMessage(authErr))
-				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
+				oauthSessions.SetErrorContext(state, ctx, "Timeout waiting for OAuth callback")
 				return
 			}
 			if data, errR := os.ReadFile(waitFile); errR == nil {
@@ -2188,19 +2243,23 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				if errStr := m["error"]; errStr != "" {
 					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
 					log.Error(codex.GetUserFriendlyMessage(oauthErr))
-					SetOAuthSessionError(state, "Bad Request")
+					oauthSessions.SetErrorContext(state, ctx, "Bad Request")
 					return
 				}
 				if m["state"] != state {
 					authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, m["state"]))
-					SetOAuthSessionError(state, "State code error")
+					oauthSessions.SetErrorContext(state, ctx, "State code error")
 					log.Error(codex.GetUserFriendlyMessage(authErr))
 					return
 				}
 				code = m["code"]
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 
 		log.Debug("Authorization code received, exchanging for tokens...")
@@ -2208,7 +2267,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
+			oauthSessions.SetErrorContext(state, ctx, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			return
 		}
@@ -2238,9 +2297,9 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, record)
 		if errSave != nil {
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
 		}
@@ -2249,11 +2308,10 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Codex services through this CLI")
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
+		oauthSessions.CompleteContext(state, ctx)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "attempt_token": oauthAttemptToken(ctx)})
 }
 
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
@@ -2274,7 +2332,12 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", antigravity.CallbackPort)
 	authURL := authSvc.BuildAuthURL(state, redirectURI)
 
-	RegisterOAuthSession(state, "antigravity")
+	var errSession error
+	ctx, errSession = oauthSessions.RegisterContext(state, "antigravity", ctx, 5*time.Minute)
+	if errSession != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start authentication session"})
+		return
+	}
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -2282,12 +2345,14 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		targetURL, errTarget := h.managementCallbackURL("/antigravity/callback")
 		if errTarget != nil {
 			log.WithError(errTarget).Error("failed to compute antigravity callback target")
+			oauthSessions.SetErrorContext(state, ctx, "Callback server unavailable")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(antigravity.CallbackPort, "antigravity", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start antigravity callback forwarder")
+			oauthSessions.SetErrorContext(state, ctx, "Could not start callback server")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
 		}
@@ -2299,6 +2364,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
+		defer os.Remove(waitFile)
 		deadline := time.Now().Add(5 * time.Minute)
 		var authCode string
 		for {
@@ -2307,7 +2373,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			}
 			if time.Now().After(deadline) {
 				log.Error("oauth flow timed out")
-				SetOAuthSessionError(state, "OAuth flow timed out")
+				oauthSessions.SetErrorContext(state, ctx, "OAuth flow timed out")
 				return
 			}
 			if data, errReadFile := os.ReadFile(waitFile); errReadFile == nil {
@@ -2316,49 +2382,53 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 				_ = os.Remove(waitFile)
 				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
 					log.Errorf("Authentication failed: %s", errStr)
-					SetOAuthSessionError(state, "Authentication failed")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed")
 					return
 				}
 				if payloadState := strings.TrimSpace(payload["state"]); payloadState != "" && payloadState != state {
 					log.Errorf("Authentication failed: state mismatch")
-					SetOAuthSessionError(state, "Authentication failed: state mismatch")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed: state mismatch")
 					return
 				}
 				authCode = strings.TrimSpace(payload["code"])
 				if authCode == "" {
 					log.Error("Authentication failed: code not found")
-					SetOAuthSessionError(state, "Authentication failed: code not found")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed: code not found")
 					return
 				}
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 
 		tokenResp, errToken := authSvc.ExchangeCodeForTokens(ctx, authCode, redirectURI)
 		if errToken != nil {
 			log.Errorf("Failed to exchange token: %v", errToken)
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to exchange token")
 			return
 		}
 
 		accessToken := strings.TrimSpace(tokenResp.AccessToken)
 		if accessToken == "" {
 			log.Error("antigravity: token exchange returned empty access token")
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to exchange token")
 			return
 		}
 
 		email, errInfo := authSvc.FetchUserInfo(ctx, accessToken)
 		if errInfo != nil {
 			log.Errorf("Failed to fetch user info: %v", errInfo)
-			SetOAuthSessionError(state, "Failed to fetch user info")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to fetch user info")
 			return
 		}
 		email = strings.TrimSpace(email)
 		if email == "" {
 			log.Error("antigravity: user info returned empty email")
-			SetOAuthSessionError(state, "Failed to fetch user info")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to fetch user info")
 			return
 		}
 
@@ -2402,15 +2472,14 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			Label:    label,
 			Metadata: metadata,
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to save token to file")
 			return
 		}
 
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("antigravity")
+		oauthSessions.CompleteContext(state, ctx)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
@@ -2418,7 +2487,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		fmt.Println("You can now use Antigravity services through this CLI")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "attempt_token": oauthAttemptToken(ctx)})
 }
 
 func (h *Handler) RequestXAIToken(c *gin.Context) {
@@ -2449,7 +2518,9 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	}
 
 	authSvc := xaiauth.NewXAIAuth(h.cfg)
-	discovery, errDiscover := authSvc.Discover(ctx)
+	discoveryCtx, cancelDiscovery := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	discovery, errDiscover := authSvc.Discover(discoveryCtx)
+	cancelDiscovery()
 	if errDiscover != nil {
 		log.Errorf("Failed to discover xAI OAuth endpoints: %v", errDiscover)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to discover oauth endpoints"})
@@ -2470,7 +2541,12 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		return
 	}
 
-	RegisterOAuthSession(state, "xai")
+	var errSession error
+	ctx, errSession = oauthSessions.RegisterContext(state, "xai", ctx, 5*time.Minute)
+	if errSession != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start authentication session"})
+		return
+	}
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -2478,12 +2554,14 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		targetURL, errTarget := h.managementCallbackURL("/xai/callback")
 		if errTarget != nil {
 			log.WithError(errTarget).Error("failed to compute xai callback target")
+			oauthSessions.SetErrorContext(state, ctx, "Callback server unavailable")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(xaiauth.CallbackPort, "xai", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start xai callback forwarder")
+			oauthSessions.SetErrorContext(state, ctx, "Could not start callback server")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
 		}
@@ -2495,6 +2573,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		}
 
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-xai-%s.oauth", state))
+		defer os.Remove(waitFile)
 		deadline := time.Now().Add(5 * time.Minute)
 		var authCode string
 		for {
@@ -2503,7 +2582,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 			}
 			if time.Now().After(deadline) {
 				log.Error("xai oauth flow timed out")
-				SetOAuthSessionError(state, "OAuth flow timed out")
+				oauthSessions.SetErrorContext(state, ctx, "OAuth flow timed out")
 				return
 			}
 			if data, errReadFile := os.ReadFile(waitFile); errReadFile == nil {
@@ -2512,36 +2591,40 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 				_ = os.Remove(waitFile)
 				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
 					log.Errorf("xAI authentication failed: %s", errStr)
-					SetOAuthSessionError(state, "Authentication failed: "+errStr)
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed: "+errStr)
 					return
 				}
 				if payloadState := strings.TrimSpace(payload["state"]); payloadState != "" && payloadState != state {
 					log.Errorf("xAI authentication failed: state mismatch")
-					SetOAuthSessionError(state, "Authentication failed: state mismatch")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed: state mismatch")
 					return
 				}
 				authCode = strings.TrimSpace(payload["code"])
 				if authCode == "" {
 					log.Error("xAI authentication failed: code not found")
-					SetOAuthSessionError(state, "Authentication failed: code not found")
+					oauthSessions.SetErrorContext(state, ctx, "Authentication failed: code not found")
 					return
 				}
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 
 		bundle, errExchange := authSvc.ExchangeCodeForTokens(ctx, authCode, redirectURI, pkceCodes, discovery.TokenEndpoint)
 		if errExchange != nil {
 			log.Errorf("Failed to exchange xAI token: %v", errExchange)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
+			oauthSessions.SetErrorContext(state, ctx, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
 			return
 		}
 
 		tokenStorage := authSvc.CreateTokenStorage(bundle)
 		if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
 			log.Error("xAI token exchange returned empty access token")
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to exchange token")
 			return
 		}
 
@@ -2584,20 +2667,19 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 				"base_url":  tokenStorage.BaseURL,
 			},
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, record)
 		if errSave != nil {
 			log.Errorf("Failed to save xAI token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to save token to file")
 			return
 		}
 
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("xai")
+		oauthSessions.CompleteContext(state, ctx)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use xAI services through this CLI")
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "attempt_token": oauthAttemptToken(ctx)})
 }
 
 func (h *Handler) RequestKimiToken(c *gin.Context) {
@@ -2611,7 +2693,9 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	kimiAuth := kimi.NewKimiAuth(h.cfg)
 
 	// Generate authorization URL
-	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
+	deviceCtx, cancelDevice := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(deviceCtx)
+	cancelDevice()
 	if errStartDeviceFlow != nil {
 		log.Errorf("Failed to generate authorization URL: %v", errStartDeviceFlow)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
@@ -2622,13 +2706,22 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		authURL = deviceFlow.VerificationURI
 	}
 
-	RegisterOAuthSession(state, "kimi")
+	kimiDuration := 15 * time.Minute
+	if deviceFlow.ExpiresIn > 0 && time.Duration(deviceFlow.ExpiresIn)*time.Second < kimiDuration {
+		kimiDuration = time.Duration(deviceFlow.ExpiresIn) * time.Second
+	}
+	var errSession error
+	ctx, errSession = oauthSessions.RegisterContext(state, "kimi", ctx, kimiDuration)
+	if errSession != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start authentication session"})
+		return
+	}
 
 	go func() {
 		fmt.Println("Waiting for authentication...")
 		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(ctx, deviceFlow)
 		if errWaitForAuthorization != nil {
-			SetOAuthSessionError(state, "Authentication failed")
+			oauthSessions.SetErrorContext(state, ctx, "Authentication failed")
 			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
 			return
 		}
@@ -2661,20 +2754,19 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: metadata,
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveOAuthTokenRecord(ctx, state, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			oauthSessions.SetErrorContext(state, ctx, "Failed to save authentication tokens")
 			return
 		}
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("kimi")
+		oauthSessions.CompleteContext(state, ctx)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "attempt_token": oauthAttemptToken(ctx)})
 }
 
 type projectSelectionRequiredError struct{}
@@ -3054,77 +3146,161 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 	return true, nil
 }
 
+// GetAuthStatus reports explicit retained outcomes; absence never proves success.
 func (h *Handler) GetAuthStatus(c *gin.Context) {
 	state := strings.TrimSpace(c.Query("state"))
 	if state == "" {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		// Auth-file overviews issue this compatibility probe without a login.
+		// HTTP success means the probe worked; its body never claims login success.
+		c.JSON(http.StatusOK, gin.H{"status": "idle", "phase": "unknown"})
 		return
 	}
 	if err := ValidateOAuthState(state); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid state"})
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "phase": "unknown", "error": "invalid state"})
 		return
 	}
+	session, ok := oauthSessions.Get(state)
+	if !ok || session.Phase != "pending" {
+		h.respondOAuthStatus(c, state, session.generation)
+		return
+	}
+	provider, isPlugin, metadata := session.Provider, session.Source == oauthSessionSourcePlugin, session.Metadata
 
-	provider, status, isPlugin, metadata, ok := GetOAuthSessionDetails(state)
-	if !ok {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		return
-	}
-	if status != "" {
-		c.JSON(http.StatusOK, gin.H{"status": "error", "error": status})
-		return
-	}
 	h.mu.Lock()
 	host := h.pluginHost
 	h.mu.Unlock()
 	if isPlugin && host != nil && host.HasAuthProvider(provider) {
-		ctx := PopulateAuthContext(context.Background(), c)
-		resp, handled, errPoll := host.PollLogin(ctx, provider, state, metadata)
-		if handled {
-			if errPoll != nil {
-				message := strings.TrimSpace(errPoll.Error())
-				if message == "" {
-					message = "Authentication failed"
-				}
-				SetOAuthSessionError(state, message)
-				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
-				return
-			}
-			switch resp.Status {
-			case "", pluginapi.AuthLoginStatusPending:
-				c.JSON(http.StatusOK, gin.H{"status": "wait"})
-				return
-			case pluginapi.AuthLoginStatusError:
-				message := strings.TrimSpace(resp.Message)
-				if message == "" {
-					message = "Authentication failed"
-				}
-				SetOAuthSessionError(state, message)
-				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
-				return
-			case pluginapi.AuthLoginStatusSuccess:
-				record := host.AuthDataToCoreAuth(resp.Auth, "", "")
-				if record == nil {
-					SetOAuthSessionError(state, "Authentication failed")
-					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
+		h.pollOAuthSession(c, state, session, func(ctx context.Context) {
+			resp, handled, errPoll := host.PollLogin(ctx, provider, state, metadata)
+			if handled {
+				if errPoll != nil {
+					message := strings.TrimSpace(errPoll.Error())
+					if message == "" {
+						message = "Authentication failed"
+					}
+					oauthSessions.SetErrorContext(state, ctx, message)
+					h.respondOAuthStatus(c, state, session.generation)
 					return
 				}
-				if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
-					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
-					SetOAuthSessionError(state, "Failed to save authentication tokens")
-					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
+				switch resp.Status {
+				case "", pluginapi.AuthLoginStatusPending:
+					h.respondOAuthStatus(c, state, session.generation)
+					return
+				case pluginapi.AuthLoginStatusError:
+					message := strings.TrimSpace(resp.Message)
+					if message == "" {
+						message = "Authentication failed"
+					}
+					oauthSessions.SetErrorContext(state, ctx, message)
+					h.respondOAuthStatus(c, state, session.generation)
+					return
+				case pluginapi.AuthLoginStatusSuccess:
+					record := host.AuthDataToCoreAuth(resp.Auth, "", "")
+					if record == nil {
+						oauthSessions.SetErrorContext(state, ctx, "Authentication failed")
+						h.respondOAuthStatus(c, state, session.generation)
+						return
+					}
+					h.completePluginOAuthLogin(ctx, c, state, provider, record)
+					return
+				default:
+					h.respondOAuthStatus(c, state, session.generation)
 					return
 				}
-				CompleteOAuthSession(state)
-				c.JSON(http.StatusOK, gin.H{"status": "ok"})
-				return
-			default:
-				c.JSON(http.StatusOK, gin.H{"status": "wait"})
-				return
 			}
+			h.respondOAuthStatus(c, state, session.generation)
+		})
+		return
+	}
+	h.respondOAuthStatus(c, state, session.generation)
+}
+
+// pollOAuthSession runs the provider operation associated with one pending state.
+func (h *Handler) pollOAuthSession(c *gin.Context, state string, observed oauthSession, poll func(context.Context)) {
+	record := oauthSessions.lookup(state)
+	if record == nil {
+		h.respondOAuthStatus(c, state, observed.generation)
+		return
+	}
+	// Poll metadata and context belong to the initial generation, including when
+	// another request waits here while that state expires and is reused.
+	record.pollMu.Lock()
+	defer record.pollMu.Unlock()
+	record.mu.Lock()
+	if !oauthSessions.currentLocked(state, record, observed.generation) {
+		record.mu.Unlock()
+		h.respondOAuthStatus(c, state, observed.generation)
+		return
+	}
+	oauthSessions.expireLocked(record)
+	pending := record.session.Phase == "pending"
+	owner := record.ctx
+	record.mu.Unlock()
+	if !pending {
+		h.respondOAuthStatus(c, state, observed.generation)
+		return
+	}
+	poll(owner)
+}
+
+// completePluginOAuthLogin centralizes persistence and the inline polling response.
+func (h *Handler) completePluginOAuthLogin(ctx context.Context, c *gin.Context, state, provider string, record *coreauth.Auth) {
+	if _, errSave := h.saveOAuthTokenRecord(ctx, state, record); errSave != nil && !errors.Is(errSave, errOAuthSessionNotPending) {
+		log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
+		oauthSessions.SetErrorContext(state, ctx, "Failed to save authentication tokens")
+	}
+	h.respondOAuthStatus(c, state, oauthGeneration(ctx))
+}
+
+// respondOAuthStatus reloads the winner after polling, cancellation, or persistence races.
+func (h *Handler) respondOAuthStatus(c *gin.Context, state string, expected ...*oauthSessionGeneration) {
+	var generation *oauthSessionGeneration
+	if len(expected) > 0 {
+		generation = expected[0]
+	}
+	session, ok := oauthSessions.getGeneration(state, generation)
+	if len(expected) > 0 && generation == nil {
+		ok = false
+	}
+	if !ok {
+		c.JSON(http.StatusOK, gin.H{"status": "error", "phase": "unknown", "error": "Authentication session is unknown; start again"})
+		return
+	}
+	status := "error"
+	if session.Phase == "succeeded" {
+		status = "ok"
+	}
+	if session.Phase == "pending" {
+		status = "wait"
+	}
+	c.JSON(http.StatusOK, gin.H{"status": status, "phase": session.Phase,
+		"error": session.Status, "expires_at": session.ExpiresAt.UTC().Format(time.RFC3339)})
+}
+
+// CancelAuth cancels one authenticated, state-bound login without deleting existing credentials.
+func (h *Handler) CancelAuth(c *gin.Context) {
+	var request struct {
+		State        string `json:"state"`
+		AttemptToken string `json:"attempt_token"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || ValidateOAuthState(request.State) != nil || request.AttemptToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid state"})
+		return
+	}
+	session, ok := oauthSessions.CancelOwned(request.State, request.AttemptToken)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "phase": "unknown"})
+		return
+	}
+	if session.Source == oauthSessionSourceBuiltin && session.Phase == "cancelled" {
+		if provider, err := NormalizeOAuthProvider(session.Provider); err == nil {
+			// The callback writer holds the same session lock; no late write can
+			// republish a file after cancel wins. Existing auth files are untouched.
+			path := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-%s-%s.oauth", provider, strings.TrimSpace(request.State)))
+			_ = os.Remove(path)
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "wait"})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "phase": session.Phase})
 }
 
 // PopulateAuthContext extracts request info and adds it to the context
