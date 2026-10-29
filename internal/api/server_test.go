@@ -257,6 +257,32 @@ func TestManagementStaticIconServesFromConfiguredStaticDirectory(t *testing.T) {
 	}
 }
 
+func TestManagementRoutesStayEnabledAcrossConfigReloadWithLocalPassword(t *testing.T) {
+	server := newTestServerWithOptions(t, WithLocalManagementPassword("local-management-password"))
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/plugins", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Authorization", "Bearer local-management-password")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("initial status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	cfg := *server.cfg
+	cfg.Debug = !cfg.Debug
+	server.UpdateClients(&cfg)
+
+	req = httptest.NewRequest(http.MethodGet, "/v0/management/plugins", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Authorization", "Bearer local-management-password")
+	rr = httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("post-reload status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+}
+
 func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

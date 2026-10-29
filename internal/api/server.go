@@ -1624,10 +1624,14 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
 	}
 	newSecretEmpty := cfg.RemoteManagement.SecretKey == ""
-	if s.envManagementSecret {
+	if s.envManagementSecret || s.localPassword != "" {
 		s.registerManagementRoutes()
 		if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-			log.Info("management routes enabled via MANAGEMENT_PASSWORD")
+			if s.localPassword != "" {
+				log.Info("management routes enabled via local management password")
+			} else {
+				log.Info("management routes enabled via MANAGEMENT_PASSWORD")
+			}
 		} else {
 			s.managementRoutesEnabled.Store(true)
 		}
