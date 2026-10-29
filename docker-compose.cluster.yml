@@ -1,6 +1,8 @@
+name: llmdynamix-engine
+
 services:
-  cli-proxy-api:
-    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
+  llmdynamix-engine:
+    image: ${LLM_DYNAMIX_ENGINE_IMAGE:-llmdynamix-engine:latest}
     pull_policy: always
     build:
       context: .
@@ -9,14 +11,14 @@ services:
         VERSION: ${VERSION:-dev}
         COMMIT: ${COMMIT:-none}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    container_name: cli-proxy-api-cluster
+    container_name: llmdynamix-engine-cluster
     environment:
       HOME_JWT: ${HOME_JWT:-}
     ports:
-      - "8317:8317"
+      - "12445:12445"
     volumes:
-      - ./home:/root/.cli-proxy-api
-      - ./logs:/CLIProxyAPI/logs
+      - ./home:/root/.llmdynamix
+      - ./logs:/llmdynamix/logs
     command: >
       sh -eu -c '
         if [ -z "$$HOME_JWT" ]; then
@@ -24,6 +26,6 @@ services:
           exit 1
         fi
 
-        exec ./CLIProxyAPI -home-jwt "$$HOME_JWT"
+        exec ./llmdynamix-engine -home-jwt "$$HOME_JWT"
       '
     restart: unless-stopped

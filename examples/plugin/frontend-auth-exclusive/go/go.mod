@@ -1,4 +1,4 @@
-module github.com/router-for-me/CLIProxyAPI/v7/examples/plugin/frontend-auth-exclusive/go
+module github.com/jecruz/llmdynamix/backend/examples/plugin/frontend-auth-exclusive/go
 
 go 1.26.0
 

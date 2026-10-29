@@ -3,7 +3,7 @@
 host: ""
 
 # Server port
-port: 8317
+port: 12445
 
 # TLS settings for HTTPS. When enabled, the server listens with the provided certificate and key.
 tls:
@@ -25,15 +25,15 @@ remote-management:
   # Disable the bundled management control panel asset download and HTTP route when true.
   disable-control-panel: false
 
-  # Disable automatic periodic background updates of the management panel from GitHub (default: false).
-  # When enabled, the panel is only downloaded on first access if missing, and never auto-updated afterward.
-  # disable-auto-update-panel: false
+  # Disable automatic periodic background updates of the management panel from GitHub.
+  # LLM Dynamix ships its own management console asset from the app bundle.
+  disable-auto-update-panel: true
 
-  # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
-  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+  # GitHub repository for optional management console release assets.
+  panel-github-repository: "https://github.com/jecruz/llmdynamix"
 
 # Authentication directory (supports ~ for home directory)
-auth-dir: "~/.cli-proxy-api"
+auth-dir: "~/.llmdynamix"
 
 # API keys for authentication
 api-keys:

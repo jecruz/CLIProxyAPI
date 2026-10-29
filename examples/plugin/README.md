@@ -1,6 +1,6 @@
 # Standard Dynamic Library Plugin Examples
 
-This directory contains standard dynamic library plugin examples for the CLIProxyAPI C ABI.
+This directory contains standard dynamic library plugin examples for the LLM Dynamix Engine plugin ABI.
 
 ## Layout
 

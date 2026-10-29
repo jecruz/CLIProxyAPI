@@ -1,6 +1,6 @@
 # JS Handler Plugin
 
-A CLIProxyAPI plugin that executes external JavaScript scripts to intercept and modify requests, responses, and streaming chunks using the Goja VM engine.
+A LLM Dynamix Engine plugin that executes external JavaScript scripts to intercept and modify requests, responses, and streaming chunks using the Goja VM engine.
 
 ## Features
 

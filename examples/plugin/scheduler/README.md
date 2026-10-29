@@ -1,6 +1,6 @@
 # Scheduler Plugin
 
-This plugin demonstrates the CLIProxyAPI C ABI scheduler capability from Go.
+This plugin demonstrates the LLM Dynamix Engine plugin ABI scheduler capability from Go.
 
 It implements:
 

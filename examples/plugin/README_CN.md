@@ -1,6 +1,6 @@
 # 标准动态库插件示例
 
-本目录包含 CLIProxyAPI C ABI 的标准动态库插件示例。
+本目录包含 LLM Dynamix Engine plugin ABI 的标准动态库插件示例。
 
 ## 目录布局
 

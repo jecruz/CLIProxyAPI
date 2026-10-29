@@ -1,4 +1,4 @@
-module github.com/router-for-me/CLIProxyAPI/v7/examples/plugin/simple/go
+module github.com/jecruz/llmdynamix/backend/examples/plugin/simple/go
 
 go 1.26.0
 

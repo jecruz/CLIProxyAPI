@@ -1,4 +1,4 @@
-module github.com/router-for-me/CLIProxyAPIPlugins/jshandler
+module github.com/jecruz/llmdynamix/backend/examples/plugin/jshandler
 
 go 1.26.0
 

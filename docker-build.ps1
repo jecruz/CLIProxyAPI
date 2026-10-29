@@ -35,8 +35,8 @@ switch ($choice) {
         Write-Host "----------------------------------------"
 
         # Build and start the services with a local-only image tag
-        $env:CLI_PROXY_IMAGE = "cli-proxy-api:local"
-        
+        $env:LLM_DYNAMIX_ENGINE_IMAGE = "llmdynamix-engine:local"
+
         Write-Host "Building the Docker image..."
         docker compose build --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT --build-arg BUILD_DATE=$BUILD_DATE
 

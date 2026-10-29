@@ -1,4 +1,4 @@
-module github.com/router-for-me/CLIProxyAPI/v7/examples/plugin/codex-service-tier/go
+module github.com/jecruz/llmdynamix/backend/examples/plugin/codex-service-tier/go
 
 go 1.26.0
 
