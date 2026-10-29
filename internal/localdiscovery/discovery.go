@@ -67,7 +67,7 @@ func New(onChange func(), listenerPorts ...int) *Controller {
 func (c *Controller) Configure(providers []config.OpenAICompatibility) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.generation++
+	changed := false
 	next := make(map[string]entry)
 	for _, p := range providers {
 		if !p.DiscoverLocalModels || p.Disabled {
@@ -82,12 +82,30 @@ func (c *Controller) Configure(providers []config.OpenAICompatibility) {
 		}
 		p.Headers = headers
 		e := entry{provider: p, status: Status{Provider: p.Name, Reason: "not_checked", Models: []*registry.ModelInfo{}}}
-		if old, ok := c.entries[key]; ok && reflect.DeepEqual(old.provider, p) {
+		if old, ok := c.entries[key]; ok && sameDiscoveryInputs(old.provider, p) {
 			e.status = old.status
+		} else {
+			changed = true
 		}
 		next[key] = e
 	}
+	if changed || len(c.entries) != len(next) {
+		c.generation++
+	}
 	c.entries = next
+}
+
+func sameDiscoveryInputs(a, b config.OpenAICompatibility) bool {
+	if a.Name != b.Name || a.BaseURL != b.BaseURL || !reflect.DeepEqual(a.Headers, b.Headers) || len(a.APIKeyEntries) != len(b.APIKeyEntries) {
+		return false
+	}
+	// Probes always bypass proxies; per-key routing proxy settings do not affect discovery.
+	for i := range a.APIKeyEntries {
+		if a.APIKeyEntries[i].APIKey != b.APIKeyEntries[i].APIKey {
+			return false
+		}
+	}
+	return true
 }
 
 // Models returns independent model records only for the current configured endpoint.
@@ -167,9 +185,10 @@ func (c *Controller) Refresh(ctx context.Context) {
 		}
 		c.mu.Lock()
 		if c.generation == generation {
-			changed = changed || !reflect.DeepEqual(e.status.Models, status.Models)
-			e.status = status
-			c.entries[key] = e
+			current := c.entries[key]
+			changed = changed || !reflect.DeepEqual(current.status.Models, status.Models)
+			current.status = status
+			c.entries[key] = current
 		}
 		c.mu.Unlock()
 	}

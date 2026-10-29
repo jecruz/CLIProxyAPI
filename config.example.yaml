@@ -305,6 +305,21 @@ nonstream-keepalive-interval: 0
 #       - name: "kimi-k2.5"
 #         alias: "claude-opus-4.66"
 
+# Local Engine Bay discovery example (opt-in; never starts engines or makes inference requests):
+# openai-compatibility:
+#   - name: "engine-bay"
+#     base-url: "http://127.0.0.1:8318/v1" # literal loopback IP, http, exact /v1 path
+#     discover-local-models: true # replace static models with the live engine's /v1/models IDs
+# Discovery runs at startup and every 30 seconds in native and Home modes.
+# Stopped/unavailable engines withdraw their catalogs; unrelated providers remain available.
+# Self-listener ports, redirects, remote hosts and proxies are rejected/bypassed.
+# Metadata probes share a two-second deadline across credential fallback attempts.
+# Under existing management authentication:
+#   GET /v0/management/local-engines returns current status and models;
+#   POST /v0/management/local-engines/refresh probes metadata immediately.
+# Priority, prefix, static-model and cooling edits retain a healthy catalog and
+# still reconcile routing; endpoint, header and credential changes invalidate it.
+
 # Vertex API keys (Vertex-compatible endpoints, base-url is optional)
 # vertex-api-key:
 #   - api-key: "vk-123..."                        # x-goog-api-key header

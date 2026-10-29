@@ -379,3 +379,63 @@ func TestDiscoveryPreservesReportedCapabilitiesWithoutGuessing(t *testing.T) {
 		t.Fatal("caller mutated cached capabilities")
 	}
 }
+
+func TestConfigureOnlyInvalidatesDiscoveryInputs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"data":[{"id":"healthy"}]}`) }))
+	defer server.Close()
+	for _, test := range []struct {
+		name     string
+		change   func(*config.OpenAICompatibility)
+		preserve bool
+	}{
+		{"priority", func(p *config.OpenAICompatibility) { p.Priority = 5 }, true},
+		{"prefix", func(p *config.OpenAICompatibility) { p.Prefix = "team" }, true},
+		{"models", func(p *config.OpenAICompatibility) {
+			p.Models = []config.OpenAICompatibilityModel{{Name: "unused-static"}}
+		}, true},
+		{"cooling", func(p *config.OpenAICompatibility) { p.DisableCooling = true }, true},
+		{"endpoint", func(p *config.OpenAICompatibility) { p.BaseURL = "http://127.0.0.1:8319/v1" }, false},
+		{"header", func(p *config.OpenAICompatibility) { p.Headers = map[string]string{"X-Fixture": "new"} }, false},
+		{"credential", func(p *config.OpenAICompatibility) {
+			p.APIKeyEntries = []config.OpenAICompatibilityAPIKey{{APIKey: "fixture-new"}}
+		}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := config.OpenAICompatibility{Name: "bay", BaseURL: server.URL + "/v1", DiscoverLocalModels: true}
+			c := New(nil)
+			c.Configure([]config.OpenAICompatibility{p})
+			c.Refresh(context.Background())
+			test.change(&p)
+			c.Configure([]config.OpenAICompatibility{p})
+			if got := c.Snapshot()[0].Available; got != test.preserve {
+				t.Fatalf("available=%v want %v", got, test.preserve)
+			}
+		})
+	}
+}
+
+func TestRoutingChangeDoesNotSupersedeActiveDiscovery(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		fmt.Fprint(w, `{"data":[{"id":"current"}]}`)
+	}))
+	defer server.Close()
+	c := New(nil)
+	p := config.OpenAICompatibility{Name: "bay", BaseURL: server.URL + "/v1", DiscoverLocalModels: true}
+	c.Configure([]config.OpenAICompatibility{p})
+	done := make(chan struct{})
+	go func() { c.Refresh(context.Background()); close(done) }()
+	<-started
+	p.Priority = 7
+	c.Configure([]config.OpenAICompatibility{p})
+	close(release)
+	<-done
+	if !c.Snapshot()[0].Available {
+		t.Fatal("routing-only change discarded in-flight catalog")
+	}
+	if c.entries["bay"].provider.Priority != 7 {
+		t.Fatal("refresh restored obsolete routing settings")
+	}
+}

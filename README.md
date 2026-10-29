@@ -53,7 +53,8 @@ this feature does not fetch additional remote provider catalogs.
 
 The compatibility provider's internal default reasoning levels remain available
 for request routing but are never advertised as verified model capabilities.
-No Sol or Terra limits are built in. An OpenRouter route's limits do not prove
+No Sol or Terra limits are built in. Configured aliases do not borrow static
+capabilities from other routes; use route-reported metadata or sourced overrides. An OpenRouter route's limits do not prove
 the capabilities of an OpenAI or Codex OAuth route with a similar name.
 
 The optional `model-capabilities` configuration map defaults to empty. Each key

@@ -10,4 +10,7 @@
 
 ### Fixed
 
+- Preserve local discovery through management GET/PUT/PATCH, retain healthy catalogs for routing-only edits, and document opt-in discovery (#4459).
+- Omit ambiguous Home route capabilities and require route-specific metadata or sourced overrides for configured aliases (#4469).
+
 - Keep local-password management authentication and routes enabled across configuration reloads (#4469 provenance preservation).

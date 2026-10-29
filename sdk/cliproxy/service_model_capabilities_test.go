@@ -20,10 +20,13 @@ func TestCompatibilityReasoningFallbackIsNotPublishedAsCapability(t *testing.T) 
 	}
 }
 
-func TestConfigAliasesPreserveVerifiedRegistryMetadata(t *testing.T) {
+func TestConfigAliasesDoNotBorrowStaticRouteCapabilities(t *testing.T) {
 	upstream := registry.GetClaudeModels()[0]
 	models := buildClaudeConfigModels(&config.ClaudeKey{Models: []config.ClaudeModel{{Name: upstream.ID, Alias: "verified-claude-alias"}}})
-	if len(models) != 1 || models[0].ID != "verified-claude-alias" || models[0].ContextLength != upstream.ContextLength || models[0].MaxCompletionTokens != upstream.MaxCompletionTokens {
-		t.Fatalf("alias discarded registry metadata: %+v", models)
+	if len(models) != 1 || models[0].ID != "verified-claude-alias" {
+		t.Fatal("alias identity changed")
+	}
+	if got := registry.ModelCapabilityFields(models[0]); len(got) != 0 {
+		t.Fatalf("configured route borrowed static capabilities: %#v", got)
 	}
 }

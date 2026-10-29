@@ -2362,17 +2362,10 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			UserDefined: true,
 		}
 		if name != "" {
-			if upstream := registry.LookupStaticModelInfo(name); upstream != nil {
+			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
+				// Preserve the existing routing fallback, not a claim about this configured route.
 				info.Thinking = upstream.Thinking
-				info.ContextLength = upstream.ContextLength
-				info.MaxCompletionTokens = upstream.MaxCompletionTokens
-				info.InputTokenLimit = upstream.InputTokenLimit
-				info.OutputTokenLimit = upstream.OutputTokenLimit
-				info.SupportedParameters = append([]string(nil), upstream.SupportedParameters...)
-				info.SupportedInputModalities = append([]string(nil), upstream.SupportedInputModalities...)
-				if upstream.Capabilities != nil {
-					info.Capabilities = upstream.Capabilities.Clone()
-				}
+				info.ThinkingDefault = true
 			}
 		}
 		out = append(out, info)

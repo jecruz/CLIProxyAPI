@@ -59,3 +59,21 @@ func TestHomeDuplicateAliasDoesNotBorrowAnotherRoutesCapabilities(t *testing.T) 
 		t.Fatalf("ambiguous route inherited claims: %#v", got)
 	}
 }
+
+func TestHomeRemoteLocalAndLocalLocalDuplicatesOmitCapabilities(t *testing.T) {
+	r := registry.GetGlobalRegistry()
+	for _, provider := range []string{"bay-a", "bay-b"} {
+		r.RegisterClient("duplicate-"+provider, provider, []*registry.ModelInfo{{ID: "shared-local", ContextLength: 32768}})
+		defer r.UnregisterClient("duplicate-" + provider)
+	}
+	cfg := &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: "bay-a", DiscoverLocalModels: true}, {Name: "bay-b", DiscoverLocalModels: true}}}
+	for _, entries := range [][]homeModelEntry{nil, {{id: "shared-local", capabilities: registry.ModelCapabilities{ContextLength: 1100000}}}} {
+		got := formatHomeOpenAIModels(appendHomeLocalModels(entries, cfg), nil)
+		if len(got) != 1 {
+			t.Fatalf("duplicate IDs not deduped: %#v", got)
+		}
+		if _, ok := got[0]["context_length"]; ok {
+			t.Fatalf("ambiguous duplicate inherited limits: %#v", got)
+		}
+	}
+}

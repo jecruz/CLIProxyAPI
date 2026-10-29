@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,5 +146,54 @@ func TestDiscoveryBlocksConfiguredBackendAndPublicListenerPorts(t *testing.T) {
 		if c.Snapshot()[0].Reason != "invalid_endpoint" {
 			t.Fatalf("configured self-listener accepted at %s", port)
 		}
+	}
+}
+
+func TestRoutingPolicyUpdateKeepsLiveCatalogAndRefreshesScheduler(t *testing.T) {
+	var probes atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			probes.Add(1)
+			fmt.Fprint(w, `{"data":[{"id":"policy-live"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"id":"policy-response","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"policy-routed"},"finish_reason":"stop"}]}`)
+	}))
+	defer upstream.Close()
+	p := config.OpenAICompatibility{Name: "policy-bay", BaseURL: upstream.URL + "/v1", DiscoverLocalModels: true}
+	cfg := &config.Config{OpenAICompatibility: []config.OpenAICompatibility{p}}
+	s := &Service{cfg: cfg, coreManager: coreauth.NewManager(nil, nil, nil)}
+	s.localDiscovery = localdiscovery.New(s.refreshLocalDiscoveryRegistrations)
+	s.localDiscovery.Configure(cfg.OpenAICompatibility)
+	s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(context.Background()), cfg)
+	defer func() {
+		for _, a := range s.coreManager.List() {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+		}
+	}()
+	s.localDiscovery.Refresh(context.Background())
+	p.Priority = 9
+	p.Prefix = "team"
+	p.Models = []config.OpenAICompatibilityModel{{Name: "unused-static"}}
+	s.applyConfigUpdate(&config.Config{SDKConfig: config.SDKConfig{ForceModelPrefix: true}, OpenAICompatibility: []config.OpenAICompatibility{p}})
+	if !s.localDiscovery.Snapshot()[0].Available || probes.Load() != 1 {
+		t.Fatal("routing policy unnecessarily withdrew or reprobed healthy catalog")
+	}
+	found := false
+	for _, a := range s.coreManager.List() {
+		for _, m := range registry.GetGlobalRegistry().GetModelsForClient(a.ID) {
+			if m.ID == "team/policy-live" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("cached models were not reconciled with new prefix")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	response, err := s.coreManager.Execute(ctx, []string{"policy-bay"}, cliproxyexecutor.Request{Model: "team/policy-live", Payload: []byte(`{"model":"team/policy-live","messages":[{"role":"user","content":"fixture"}]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err != nil || !strings.Contains(string(response.Payload), "policy-routed") {
+		t.Fatalf("scheduler did not reconcile preserved catalog: %v", err)
 	}
 }

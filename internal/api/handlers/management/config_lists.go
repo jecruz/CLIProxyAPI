@@ -462,13 +462,14 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Prefix        *string                             `json:"prefix"`
-		Disabled      *bool                               `json:"disabled"`
-		BaseURL       *string                             `json:"base-url"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		DiscoverLocalModels *bool                               `json:"discover-local-models"`
+		Name                *string                             `json:"name"`
+		Prefix              *string                             `json:"prefix"`
+		Disabled            *bool                               `json:"disabled"`
+		BaseURL             *string                             `json:"base-url"`
+		APIKeyEntries       *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models              *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers             *map[string]string                  `json:"headers"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -501,6 +502,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 
 	entry := h.cfg.OpenAICompatibility[targetIndex]
+	if body.Value.DiscoverLocalModels != nil {
+		entry.DiscoverLocalModels = *body.Value.DiscoverLocalModels
+	}
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
 	}

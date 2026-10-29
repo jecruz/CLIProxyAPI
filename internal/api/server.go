@@ -1296,19 +1296,23 @@ func appendHomeLocalModels(entries []homeModelEntry, cfg *config.Config) []homeM
 	if cfg == nil {
 		return entries
 	}
-	seen := make(map[string]bool, len(entries))
-	for _, entry := range entries {
-		seen[entry.id] = true
+	seen := make(map[string]int, len(entries))
+	for index, entry := range entries {
+		seen[entry.id] = index
 	}
 	for _, provider := range cfg.OpenAICompatibility {
 		if provider.Disabled || !provider.DiscoverLocalModels {
 			continue
 		}
 		for _, model := range registry.GetGlobalRegistry().GetAvailableModelsByProvider(provider.Name) {
-			if model == nil || seen[model.ID] {
+			if model == nil {
 				continue
 			}
-			seen[model.ID] = true
+			if index, exists := seen[model.ID]; exists {
+				entries[index].capabilities = registry.ModelCapabilities{}
+				continue
+			}
+			seen[model.ID] = len(entries)
 			entries = append(entries, homeModelEntry{id: model.ID, created: model.Created, ownedBy: model.OwnedBy, displayName: model.DisplayName, capabilities: registry.CapabilitiesFromMetadata(registry.ModelCapabilityFields(model))})
 		}
 	}
