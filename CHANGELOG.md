@@ -14,6 +14,9 @@
 
 ### Fixed
 
+- Resolve all provider-doctor Keychain references before probing, refusing mixed
+  providers with any unavailable reference without an upstream request (#4578).
+
 - Preserve local discovery through management GET/PUT/PATCH, retain healthy catalogs for routing-only edits, and document opt-in discovery (#4459).
 - Omit ambiguous Home route capabilities and require route-specific metadata or sourced overrides for configured aliases (#4469).
 

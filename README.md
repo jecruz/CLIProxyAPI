@@ -30,7 +30,9 @@ the engine consumes/unsets it before plugin startup. Resolved keys exist only
 in runtime-only auths: config retains references, persistence/export is blocked,
 and account/log metadata omits key material. Missing or malformed references
 disable the entire affected provider, including mixed literal/reference keys.
-Rotation requires a fresh app-owned backend launch. No migration is performed.
+Provider-doctor live probes resolve every entry before sending a request and
+refuse the entire provider if any reference is unavailable. Rotation requires a
+fresh app-owned backend launch. No migration is performed.
 
 - Product name in runtime output: `LLM Dynamix Engine`
 - Default backend port: `12445`

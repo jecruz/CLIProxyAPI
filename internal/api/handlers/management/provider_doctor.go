@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/providerkeys"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -297,11 +298,15 @@ func (h *Handler) providerDoctorAPIProbeRequest(ctx context.Context, provider, m
 		if provider == nil {
 			return nil, "missing_credential", []string{"No enabled OpenAI-compatible API provider with a key and base URL is configured for live probing."}
 		}
+		apiKey, available := firstOpenAICompatibilityAPIKey(*provider)
+		if !available {
+			return nil, "credential_unavailable", []string{"A provider Keychain credential is unavailable; the entire provider is disabled."}
+		}
 		req, err := providerDoctorNewGETRequest(ctx, provider.BaseURL, "/models")
 		if err != nil {
 			return nil, "invalid_endpoint", []string{"OpenAI-compatible API base URL is invalid."}
 		}
-		req.Header.Set("Authorization", "Bearer "+firstOpenAICompatibilityAPIKey(*provider))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 		for key, value := range provider.Headers {
 			if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
 				continue
@@ -916,13 +921,22 @@ func openAICompatibilityProviderProbeReady(provider config.OpenAICompatibility) 
 	return false
 }
 
-func firstOpenAICompatibilityAPIKey(provider config.OpenAICompatibility) string {
+func firstOpenAICompatibilityAPIKey(provider config.OpenAICompatibility) (string, bool) {
+	first := ""
 	for _, entry := range provider.APIKeyEntries {
-		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			return key
+		key := strings.TrimSpace(entry.APIKey)
+		if providerkeys.IsReference(key) {
+			var available bool
+			key, available = providerkeys.Resolve(key)
+			if !available {
+				return "", false
+			}
+		}
+		if first == "" && key != "" {
+			first = key
 		}
 	}
-	return ""
+	return first, first != ""
 }
 
 func providerDoctorHTTPProbeStatus(status int) (string, string) {
