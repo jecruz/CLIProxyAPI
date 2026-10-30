@@ -266,6 +266,9 @@ func (a *Auth) indexSeed() string {
 		compatName = strings.TrimSpace(a.Attributes["compat_name"])
 		baseURL = strings.TrimSpace(a.Attributes["base_url"])
 		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+		if reference := a.Attributes["keychain_reference"]; reference != "" {
+			apiKey = reference
+		}
 		filePath = strings.TrimSpace(a.Attributes["path"])
 		if filePath == "" {
 			filePath = strings.TrimSpace(a.Attributes["source"])
@@ -507,6 +510,9 @@ func parseIntAny(val any) (int, bool) {
 func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
+	}
+	if reference := a.Attributes["keychain_reference"]; reference != "" {
+		return "api_key", reference
 	}
 	// For Gemini CLI, include project ID in the OAuth account info if present.
 	if strings.ToLower(a.Provider) == "gemini-cli" {

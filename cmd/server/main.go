@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/providerkeys"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
@@ -87,6 +88,9 @@ func loadManagementPasswordFromEnvironment() string {
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
 func main() {
+	if errKeys := providerkeys.ConsumeEnvironment(); errKeys != nil {
+		log.Warn("Provider credential map rejected; Keychain providers unavailable")
+	}
 	fmt.Println(versionLine())
 
 	// Command-line flags to control the application's behavior.
@@ -210,6 +214,8 @@ func main() {
 			log.WithError(errLoad).Warn("failed to load .env file")
 		}
 	}
+	// Never allow a dotenv entry to reintroduce the consumed transport into children.
+	_ = os.Unsetenv(providerkeys.EnvironmentName)
 
 	lookupEnv := func(keys ...string) (string, bool) {
 		for _, key := range keys {

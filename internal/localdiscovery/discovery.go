@@ -18,6 +18,7 @@ import (
 	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/providerkeys"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
@@ -244,14 +245,24 @@ func (c *Controller) probe(ctx context.Context, p config.OpenAICompatibility) St
 	// Credential fallback shares one deadline rather than multiplying probe latency.
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	keys := p.APIKeyEntries
+	keys := make([]string, len(p.APIKeyEntries))
+	for i, entry := range p.APIKeyEntries {
+		keys[i] = strings.TrimSpace(entry.APIKey)
+		if providerkeys.IsReference(keys[i]) {
+			value, ok := providerkeys.Resolve(keys[i])
+			if !ok {
+				return Status{Provider: p.Name, Reason: "credential_unavailable", CheckedAt: time.Now().UTC(), Models: []*registry.ModelInfo{}}
+			}
+			keys[i] = value
+		}
+	}
 	if len(keys) == 0 {
-		keys = []config.OpenAICompatibilityAPIKey{{}}
+		keys = []string{""}
 	}
 	var status Status
 	for _, key := range keys {
 		var rejected bool
-		status, rejected = c.probeCredential(probeCtx, p, key.APIKey)
+		status, rejected = c.probeCredential(probeCtx, p, key)
 		if !rejected || probeCtx.Err() != nil {
 			break
 		}

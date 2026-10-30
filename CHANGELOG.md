@@ -4,6 +4,10 @@
 
 ### Added
 
+- Resolve provider Keychain references from a consumed per-launch memory map;
+  fail closed and exclude resolved credentials from config, persistence, export
+  and account/log metadata (#4565).
+
 - Publish verified model context, output, reasoning, tool, and image-input capabilities in native and Home `/v1/models` catalogs, including local engine metadata and optional sourced operator overrides (#4469).
 
 - Discover explicitly configured local engine catalogs in native and Home modes, with authenticated status/refresh endpoints and cancelable bounded probes (#4459).

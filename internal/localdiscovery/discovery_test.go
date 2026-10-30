@@ -11,8 +11,33 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/providerkeys"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
+
+// TestProviderReferenceDiscovery never probes an unresolved provider or sends a reference literally.
+func TestProviderReferenceDiscovery(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer fixture-only" {
+			t.Error("discovery did not resolve the credential")
+		}
+		fmt.Fprint(w, `{"data":[{"id":"fixture"}]}`)
+	}))
+	defer server.Close()
+	for _, raw := range []string{"", `{"keychain://caiss/providers/FIXTURE":"fixture-only"}`} {
+		t.Setenv(providerkeys.EnvironmentName, raw)
+		_ = providerkeys.ConsumeEnvironment()
+		p := config.OpenAICompatibility{Name: "fixture", BaseURL: server.URL + "/v1", APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "keychain://caiss/providers/FIXTURE"}, {APIKey: "literal-fixture"}}}
+		before := calls.Load()
+		status := New(nil).probe(context.Background(), p)
+		if raw == "" && (status.Available || calls.Load() != before) || raw != "" && !status.Available {
+			t.Fatal("discovery must disable a mixed provider before any request when a reference is unavailable")
+		}
+	}
+	_ = providerkeys.ConsumeEnvironment()
+}
 
 func TestLiveCatalogSwitchAndDownWithdrawsModels(t *testing.T) {
 	var response atomic.Value

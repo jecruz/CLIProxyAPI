@@ -718,6 +718,14 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "name must end with .json"})
 		return
 	}
+	if h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if isRuntimeOnlyAuth(auth) && (auth.ID == name || auth.FileName == name) {
+				c.JSON(http.StatusForbidden, gin.H{"error": "runtime-only credentials cannot be exported"})
+				return
+			}
+		}
+	}
 	full := filepath.Join(h.cfg.AuthDir, name)
 	data, err := os.ReadFile(full)
 	if err != nil {

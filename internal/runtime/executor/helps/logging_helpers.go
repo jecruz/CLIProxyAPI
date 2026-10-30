@@ -63,6 +63,12 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 	if !requestLogCaptureEnabled(cfg) {
 		return
 	}
+	if info.AuthType == "api_key" && strings.HasPrefix(info.AuthValue, "keychain://caiss/providers/") {
+		info.Headers = info.Headers.Clone()
+		if info.Headers != nil {
+			info.Headers.Set("Authorization", "[redacted]")
+		}
+	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return

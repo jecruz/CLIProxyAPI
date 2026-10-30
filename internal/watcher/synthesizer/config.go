@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/providerkeys"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -228,15 +229,32 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 		base := strings.TrimSpace(compat.BaseURL)
 		disableCooling := compat.DisableCooling
+		keys := make([]string, len(compat.APIKeyEntries))
+		available := true
+		for j, entry := range compat.APIKeyEntries {
+			keys[j] = strings.TrimSpace(entry.APIKey)
+			if providerkeys.IsReference(keys[j]) {
+				var ok bool
+				keys[j], ok = providerkeys.Resolve(keys[j])
+				if !ok {
+					available = false
+					break
+				}
+			}
+		}
+		if !available { // A mixed provider must never fall back to another key or anonymous auth.
+			continue
+		}
 
 		// Handle new APIKeyEntries format (preferred)
 		createdEntries := 0
 		for j := range compat.APIKeyEntries {
 			entry := &compat.APIKeyEntries[j]
-			key := strings.TrimSpace(entry.APIKey)
+			reference := strings.TrimSpace(entry.APIKey)
+			key := keys[j]
 			proxyURL := strings.TrimSpace(entry.ProxyURL)
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
-			id, token := idGen.Next(idKind, key, base, proxyURL)
+			id, token := idGen.Next(idKind, reference, base, proxyURL)
 			attrs := map[string]string{
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
@@ -244,6 +262,10 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
+			if providerkeys.IsReference(reference) {
+				attrs["runtime_only"] = "true"
+				attrs["keychain_reference"] = reference
+			}
 			if disableCooling {
 				metadata["disable_cooling"] = true
 			}

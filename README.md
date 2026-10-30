@@ -23,6 +23,15 @@ src/Sources/Resources/llmdynamix-engine
 
 ## Runtime Defaults
 
+OpenAI-compatible keys may be `keychain://caiss/providers/NAME` references
+(ASCII account names: letter/underscore, then up to 127 letters/digits/`_.-`).
+The app supplies `LLMDYNAMIX_PROVIDER_KEYS_JSON` only in the child environment;
+the engine consumes/unsets it before plugin startup. Resolved keys exist only
+in runtime-only auths: config retains references, persistence/export is blocked,
+and account/log metadata omits key material. Missing or malformed references
+disable the entire affected provider, including mixed literal/reference keys.
+Rotation requires a fresh app-owned backend launch. No migration is performed.
+
 - Product name in runtime output: `LLM Dynamix Engine`
 - Default backend port: `12445`
 - Default auth/config directory: `~/.llmdynamix`
